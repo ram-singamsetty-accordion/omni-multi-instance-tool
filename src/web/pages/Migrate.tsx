@@ -1,14 +1,14 @@
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../lib/api';
+import { api, PlanChangedError } from '../lib/api';
 import { FolderPicker } from '../lib/FolderPicker';
 import type { FolderRef, JobPlan, OmniDoc, PostMigrationAction, PostMigrationActionResult } from '../../shared/types';
 
 export default function Migrate() {
   const nav = useNavigate();
   const qc = useQueryClient();
-  const { data: instances } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
+  const { data: instances, isLoading: instancesLoading, error: instancesError } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
 
   const sources = useMemo(() => instances?.filter(i => i.role === 'source') ?? [], [instances]);
   const dests = useMemo(() => instances?.filter(i => i.role === 'destination') ?? [], [instances]);
@@ -19,7 +19,7 @@ export default function Migrate() {
   const [destFolders, setDestFolders] = useState<Record<string, FolderRef>>({});
   const [docIds, setDocIds] = useState<string[]>([]);
   const [emptyFirst, setEmptyFirst] = useState(false);
-  const [plan, setPlan] = useState<JobPlan | null>(null);
+  const [planState, setPlanState] = useState<{ plan: JobPlan; key: string } | null>(null);
   const [fixingId, setFixingId] = useState<string | null>(null);
   const [postMigrationActions, setPostMigrationActions] = useState<PostMigrationAction[]>([]);
   const [enabledActionIndices, setEnabledActionIndices] = useState<Set<number>>(new Set());
@@ -33,6 +33,16 @@ export default function Migrate() {
     enabled: !!sourceId && !!sourceFolderId,
   });
 
+  // Selected docs that vanished from the refetched listing (deleted, moved, archived) are dropped.
+  const effectiveDocIds = useMemo(() => {
+    if (!docs.data) return [];
+    const present = new Set(docs.data.map(d => d.identifier));
+    return docIds.filter(id => present.has(id));
+  }, [docIds, docs.data]);
+  useEffect(() => {
+    if (docs.data && effectiveDocIds.length !== docIds.length) setDocIds(effectiveDocIds);
+  }, [docs.data, effectiveDocIds, docIds]);
+
   const selectedDestFolders = useMemo(() => {
     const out: Record<string, FolderRef> = {};
     for (const id of destIds) if (destFolders[id]) out[id] = destFolders[id]!;
@@ -40,31 +50,49 @@ export default function Migrate() {
   }, [destIds, destFolders]);
   const destsMissingFolder = dests.filter(d => destIds.includes(d.id) && !destFolders[d.id] && !d.folderId);
 
+  // The plan is only valid for the exact form it was built from; any edit hides it and disables Execute.
+  const formKey = JSON.stringify({ sourceId, destIds, docIds: effectiveDocIds, emptyFirst, sourceFolder, destFolders: selectedDestFolders });
+  const plan = planState && planState.key === formKey ? planState.plan : null;
+
+  // Only re-sync on a source change: a re-sync after each save's refetch would reset the per-run toggles.
   useEffect(() => {
     const actions = sourceInstance?.postMigrationActions ?? [];
     setPostMigrationActions(actions);
     setEnabledActionIndices(new Set(actions.map((_, i) => i)));
-  }, [sourceId, sourceInstance?.postMigrationActions]);
+  }, [sourceId]);
 
   const preview = useMutation({
-    mutationFn: () => api.previewJob({ sourceId, destIds, docIds, emptyFirst, sourceFolder: sourceFolder ?? undefined, destFolders: selectedDestFolders }),
-    onSuccess: p => setPlan(p),
+    mutationFn: async () => {
+      const key = formKey;
+      const p = await api.previewJob({ sourceId, destIds, docIds: effectiveDocIds, emptyFirst, sourceFolder: sourceFolder ?? undefined, destFolders: selectedDestFolders });
+      return { p, key };
+    },
+    onSuccess: ({ p, key }) => {
+      execute.reset();
+      setPlanState({ plan: p, key });
+    },
   });
 
+  // Execute names the plan the user reviewed. If the destination changed since, the server runs
+  // nothing and returns the new plan, which replaces the one on screen for a fresh review.
   const execute = useMutation({
-    mutationFn: () => api.createJob({
-      sourceId, destIds, docIds, emptyFirst,
+    mutationFn: ({ plan: reviewed }: { plan: JobPlan; key: string }) => api.createJob({
+      sourceId, destIds, docIds: effectiveDocIds, emptyFirst,
+      expectedDigest: reviewed.digest,
       sourceFolder: sourceFolder ?? undefined,
       destFolders: selectedDestFolders,
       postMigrationActions: postMigrationActions.filter((_, i) => enabledActionIndices.has(i)),
     }),
     onSuccess: ({ job }) => nav(`/jobs/${job.id}`),
+    onError: (e, { key }) => {
+      if (e instanceof PlanChangedError) setPlanState({ plan: e.plan, key });
+    },
   });
 
   const toggle = (arr: string[], id: string): string[] =>
     arr.includes(id) ? arr.filter(x => x !== id) : [...arr, id];
 
-  const canPreview = sourceId && destIds.length > 0 && docIds.length > 0 && destsMissingFolder.length === 0;
+  const canPreview = sourceId && destIds.length > 0 && effectiveDocIds.length > 0 && destsMissingFolder.length === 0;
 
   return (
     <div className="space-y-6">
@@ -73,7 +101,7 @@ export default function Migrate() {
           <label className="block text-xs text-zinc-400 mb-1">Source</label>
           <select
             value={sourceId}
-            onChange={e => { setSourceId(e.target.value); setSourceFolder(null); setDocIds([]); setPlan(null); }}
+            onChange={e => { setSourceId(e.target.value); setSourceFolder(null); setDocIds([]); }}
             className="w-full bg-zinc-950 border border-zinc-700 rounded px-2 py-1.5 text-sm"
           >
             <option value="">— pick source —</option>
@@ -85,10 +113,11 @@ export default function Migrate() {
             <div className="mt-2">
               <label className="block text-xs text-zinc-400 mb-1">Source folder</label>
               <FolderPicker
+                key={sourceInstance.id}
                 instanceId={sourceInstance.id}
                 value={sourceFolder}
                 defaultFolder={{ id: sourceInstance.folderId, path: sourceInstance.folderPath }}
-                onChange={f => { setSourceFolder(f); setDocIds([]); setPlan(null); }}
+                onChange={f => { setSourceFolder(f); setDocIds([]); }}
               />
             </div>
           )}
@@ -106,12 +135,14 @@ export default function Migrate() {
                   type="checkbox"
                   className="mr-2"
                   checked={destIds.includes(d.id)}
-                  onChange={() => { setDestIds(toggle(destIds, d.id)); setPlan(null); }}
+                  onChange={() => setDestIds(toggle(destIds, d.id))}
                 />
                 {d.label}
               </label>
             ))}
-            {dests.length === 0 && <span className="text-sm text-zinc-500">No destinations. Add some under Instances.</span>}
+            {instancesLoading && <span className="text-sm text-zinc-500">loading…</span>}
+            {instancesError && <span className="text-sm text-red-400">{(instancesError as Error).message}</span>}
+            {instances && dests.length === 0 && <span className="text-sm text-zinc-500">No destinations. Add some under Instances.</span>}
           </div>
           {destIds.length > 0 && (
             <div className="mt-3 space-y-2">
@@ -128,7 +159,6 @@ export default function Migrate() {
                         if (f) next[d.id] = f; else delete next[d.id];
                         return next;
                       });
-                      setPlan(null);
                     }}
                   />
                 </div>
@@ -138,7 +168,7 @@ export default function Migrate() {
         </div>
 
         <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={emptyFirst} onChange={e => { setEmptyFirst(e.target.checked); setPlan(null); }} />
+          <input type="checkbox" checked={emptyFirst} onChange={e => setEmptyFirst(e.target.checked)} />
           Empty each destination folder before migrating (docs that already exist by name are still updated in place)
         </label>
       </section>
@@ -160,11 +190,8 @@ export default function Migrate() {
                     <th className="p-2 w-8">
                       <input
                         type="checkbox"
-                        checked={docs.data.length > 0 && docIds.length === docs.data.length}
-                        onChange={e => {
-                          setDocIds(e.target.checked ? docs.data.map(d => d.identifier) : []);
-                          setPlan(null);
-                        }}
+                        checked={docs.data.length > 0 && effectiveDocIds.length === docs.data.length}
+                        onChange={e => setDocIds(e.target.checked ? docs.data.map(d => d.identifier) : [])}
                       />
                     </th>
                     <th className="p-2">Name</th>
@@ -185,7 +212,7 @@ export default function Migrate() {
                             <input
                               type="checkbox"
                               checked={docIds.includes(d.identifier)}
-                              onChange={() => { setDocIds(toggle(docIds, d.identifier)); setPlan(null); }}
+                              onChange={() => setDocIds(toggle(effectiveDocIds, d.identifier))}
                             />
                           </td>
                           <td className="p-2">{d.name}</td>
@@ -240,12 +267,13 @@ export default function Migrate() {
 
       {sourceId && (
         <PostMigrationActionsEditor
+          key={sourceId}
           sourceId={sourceId}
           actions={postMigrationActions}
           enabledIndices={enabledActionIndices}
-          onChangeActions={actions => {
+          onChangeActions={(actions, enabled) => {
             setPostMigrationActions(actions);
-            setEnabledActionIndices(new Set(actions.map((_, i) => i)));
+            setEnabledActionIndices(enabled);
           }}
           onToggleEnabled={idx => setEnabledActionIndices(prev => {
             const next = new Set(prev);
@@ -266,7 +294,7 @@ export default function Migrate() {
         {plan && (
           <button
             disabled={execute.isPending}
-            onClick={() => execute.mutate()}
+            onClick={() => execute.mutate({ plan, key: formKey })}
             className="bg-emerald-500 text-emerald-950 rounded px-4 py-2 font-medium disabled:opacity-40"
           >
             {execute.isPending ? 'starting…' : 'Execute migration'}
@@ -280,6 +308,11 @@ export default function Migrate() {
         </div>
       )}
       {preview.error && <div className="text-sm text-red-400">{(preview.error as Error).message}</div>}
+      {plan && execute.error && (
+        <div className={`text-sm ${execute.error instanceof PlanChangedError ? 'text-amber-300' : 'text-red-400'}`}>
+          {(execute.error as Error).message}
+        </div>
+      )}
       {plan && <PlanView plan={plan} />}
     </div>
   );
@@ -338,6 +371,8 @@ function FixPanel({
   const [desc, setDesc] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
   const [clearExistingDraft, setClearExistingDraft] = useState(false);
+  const [publishedDesc, setPublishedDesc] = useState<string | null>(null);
+  const qc = useQueryClient();
 
   const labels = useQuery({
     queryKey: ['labels', instanceId],
@@ -347,17 +382,21 @@ function FixPanel({
 
   const save = useMutation({
     mutationFn: async () => {
-      if (needDesc && desc.trim()) {
+      // Each patchDoc publishes a new version, so a retry after a label failure must not repeat it.
+      if (needDesc && desc.trim() && desc !== publishedDesc) {
         await api.patchDoc(instanceId, doc.identifier, {
           description: desc,
           ...(clearExistingDraft ? { clearExistingDraft: true } : {}),
         });
+        setPublishedDesc(desc);
       }
       if (needLabels && selected.length > 0) {
         await api.setDocumentLabels(instanceId, doc.identifier, { add: selected });
       }
     },
     onSuccess: () => onSaved(),
+    // The description may already be published; refetch so the row and needDesc reflect it.
+    onError: () => { qc.invalidateQueries({ queryKey: ['folder', instanceId] }); },
   });
 
   const toggleLabel = (name: string): void =>
@@ -442,6 +481,21 @@ function FixPanel({
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 const blankAction: PostMigrationAction = { method: 'POST', url: '', headers: {}, body: '' };
 
+// Header rows carry a stable id so renaming one never remounts it or collides with another.
+interface HeaderRow { id: number; key: string; value: string }
+let rowSeq = 0;
+const toRows = (h: Record<string, string>): HeaderRow[] =>
+  Object.entries(h).map(([key, value]) => ({ id: ++rowSeq, key, value }));
+
+function isHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s.trim());
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function ActionResult({ result: r }: { result: PostMigrationActionResult }) {
   const [open, setOpen] = useState(false);
   return (
@@ -474,62 +528,104 @@ function PostMigrationActionsEditor({
   sourceId: string;
   actions: PostMigrationAction[];
   enabledIndices: Set<number>;
-  onChangeActions: (actions: PostMigrationAction[]) => void;
+  onChangeActions: (actions: PostMigrationAction[], enabled: Set<number>) => void;
   onToggleEnabled: (idx: number) => void;
 }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [editingAction, setEditingAction] = useState<PostMigrationAction | null>(null);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [headerRows, setHeaderRows] = useState<HeaderRow[]>([]);
   const [runResults, setRunResults] = useState<PostMigrationActionResult[] | null>(null);
   const [running, setRunning] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
-  const saveToSource = async (next: PostMigrationAction[]): Promise<void> => {
-    await api.saveInstanceActions(sourceId, next);
-    qc.invalidateQueries({ queryKey: ['instances'] });
+  const nameCounts = new Map<string, number>();
+  for (const r of headerRows) {
+    const n = r.key.trim().toLowerCase();
+    if (n) nameCounts.set(n, (nameCounts.get(n) ?? 0) + 1);
+  }
+  const dupIds = new Set(headerRows.filter(r => (nameCounts.get(r.key.trim().toLowerCase()) ?? 0) > 1).map(r => r.id));
+
+  const startEdit = (action: PostMigrationAction, index: number | null): void => {
+    setEditingAction(action);
+    setEditingIndex(index);
+    setHeaderRows(toRows(action.headers));
+  };
+
+  const closeEdit = (): void => {
+    setEditingAction(null);
+    setEditingIndex(null);
+    setHeaderRows([]);
+  };
+
+  const saveToSource = async (next: PostMigrationAction[], prev: PostMigrationAction[], prevEnabled: Set<number>): Promise<void> => {
+    setActionError(null);
+    try {
+      await api.saveInstanceActions(sourceId, next);
+      qc.invalidateQueries({ queryKey: ['instances'] });
+    } catch (e) {
+      // Roll back explicitly: the refetch returns the unchanged server list, which no longer re-syncs the parent.
+      // Skip it if the source changed meanwhile, since prev belongs to the previous source.
+      if (!mounted.current) return;
+      onChangeActions(prev, prevEnabled);
+      setActionError(`Could not save actions: ${(e as Error).message}`);
+    }
   };
 
   const commitEdit = (): void => {
     if (!editingAction) return;
+    const saved: PostMigrationAction = {
+      ...editingAction,
+      url: editingAction.url.trim(),
+      headers: Object.fromEntries(headerRows.filter(r => r.key.trim()).map(r => [r.key.trim(), r.value])),
+      body: editingAction.method === 'GET' ? '' : editingAction.body,
+    };
     const next = [...actions];
-    if (editingIndex === null) next.push(editingAction);
-    else next[editingIndex] = editingAction;
-    onChangeActions(next);
-    void saveToSource(next);
-    setEditingAction(null);
-    setEditingIndex(null);
+    let enabled = enabledIndices;
+    if (editingIndex === null) {
+      next.push(saved);
+      enabled = new Set([...enabledIndices, next.length - 1]);
+    } else {
+      next[editingIndex] = saved;
+    }
+    onChangeActions(next, enabled);
+    void saveToSource(next, actions, enabledIndices);
+    closeEdit();
   };
 
   const removeAction = (idx: number): void => {
     const next = actions.filter((_, i) => i !== idx);
-    onChangeActions(next);
-    void saveToSource(next);
+    const enabled = new Set([...enabledIndices].filter(i => i !== idx).map(i => (i > idx ? i - 1 : i)));
+    onChangeActions(next, enabled);
+    void saveToSource(next, actions, enabledIndices);
   };
 
-  const setHeader = (key: string, value: string): void => {
-    if (!editingAction) return;
-    setEditingAction({ ...editingAction, headers: { ...editingAction.headers, [key]: value } });
-  };
+  const setHeaderKey = (id: number, key: string): void =>
+    setHeaderRows(rows => rows.map(r => (r.id === id ? { ...r, key } : r)));
 
-  const addHeader = (): void => {
-    if (!editingAction) return;
-    setEditingAction({ ...editingAction, headers: { ...editingAction.headers, '': '' } });
-  };
+  const setHeaderValue = (id: number, value: string): void =>
+    setHeaderRows(rows => rows.map(r => (r.id === id ? { ...r, value } : r)));
 
-  const removeHeader = (key: string): void => {
-    if (!editingAction) return;
-    const { [key]: _, ...rest } = editingAction.headers;
-    void _;
-    setEditingAction({ ...editingAction, headers: rest });
-  };
+  const addHeader = (): void => setHeaderRows(rows => [...rows, { id: ++rowSeq, key: '', value: '' }]);
+
+  const removeHeader = (id: number): void => setHeaderRows(rows => rows.filter(r => r.id !== id));
 
   const runNow = async (): Promise<void> => {
     setRunning(true);
     setRunResults(null);
+    setActionError(null);
     try {
       const enabled = actions.filter((_, i) => enabledIndices.has(i));
       const { results } = await api.runActions(enabled);
       setRunResults(results);
+    } catch (e) {
+      setActionError((e as Error).message);
     } finally {
       setRunning(false);
     }
@@ -574,8 +670,20 @@ function PostMigrationActionsEditor({
               />
               <span className="font-mono text-zinc-400 w-14 shrink-0">{a.method}</span>
               <span className="font-mono text-zinc-300 flex-1 truncate">{a.url}</span>
-              <button className="text-zinc-500 hover:text-zinc-300" onClick={() => { setEditingAction(a); setEditingIndex(idx); }}>edit</button>
-              <button className="text-red-500 hover:text-red-400" onClick={() => removeAction(idx)}>×</button>
+              <button
+                className="text-zinc-500 hover:text-zinc-300 disabled:opacity-40"
+                disabled={editingAction !== null}
+                onClick={() => startEdit(a, idx)}
+              >
+                edit
+              </button>
+              <button
+                className="text-red-500 hover:text-red-400 disabled:opacity-40"
+                disabled={editingAction !== null}
+                onClick={() => removeAction(idx)}
+              >
+                ×
+              </button>
             </div>
           ))}
 
@@ -584,7 +692,7 @@ function PostMigrationActionsEditor({
               <div className="flex gap-2">
                 <select
                   value={editingAction.method}
-                  onChange={e => setEditingAction({ ...editingAction, method: e.target.value })}
+                  onChange={e => setEditingAction({ ...editingAction, method: e.target.value, ...(e.target.value === 'GET' ? { body: '' } : {}) })}
                   className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1"
                 >
                   {HTTP_METHODS.map(m => <option key={m}>{m}</option>)}
@@ -596,40 +704,40 @@ function PostMigrationActionsEditor({
                   onChange={e => setEditingAction({ ...editingAction, url: e.target.value })}
                 />
               </div>
+              {editingAction.url.trim() !== '' && !isHttpUrl(editingAction.url) && (
+                <div className="text-amber-300">URL must be a full http:// or https:// address.</div>
+              )}
 
               <div className="space-y-1">
                 <div className="text-zinc-500">Headers</div>
-                {Object.entries(editingAction.headers).map(([k, v]) => (
-                  <div key={k} className="flex gap-1">
+                {headerRows.map(row => (
+                  <div key={row.id} className="flex gap-1">
                     <input
-                      className="w-36 bg-zinc-900 border border-zinc-700 rounded px-2 py-0.5 font-mono"
+                      className={`w-36 bg-zinc-900 border rounded px-2 py-0.5 font-mono ${dupIds.has(row.id) ? 'border-red-500' : 'border-zinc-700'}`}
                       placeholder="Header-Name"
-                      defaultValue={k}
-                      onBlur={e => {
-                        const newKey = e.target.value;
-                        if (newKey !== k && editingAction) {
-                          const { [k]: val, ...rest } = editingAction.headers;
-                          setEditingAction({ ...editingAction, headers: { ...rest, [newKey]: val ?? v } });
-                        }
-                      }}
+                      title={dupIds.has(row.id) ? 'Duplicate header name' : undefined}
+                      value={row.key}
+                      onChange={e => setHeaderKey(row.id, e.target.value)}
                     />
                     <input
                       className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2 py-0.5 font-mono"
                       placeholder="value"
-                      value={v}
-                      onChange={e => setHeader(k, e.target.value)}
+                      value={row.value}
+                      onChange={e => setHeaderValue(row.id, e.target.value)}
                     />
-                    <button className="text-red-500 hover:text-red-400 px-1" onClick={() => removeHeader(k)}>×</button>
+                    <button className="text-red-500 hover:text-red-400 px-1" onClick={() => removeHeader(row.id)}>×</button>
                   </div>
                 ))}
+                {dupIds.size > 0 && <div className="text-red-400">Duplicate header names. Rename or remove one.</div>}
                 <button className="text-zinc-500 hover:text-zinc-300" onClick={addHeader}>+ header</button>
               </div>
 
               <div>
                 <div className="text-zinc-500 mb-1">Body</div>
                 <textarea
-                  className="w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1 font-mono h-20 resize-y"
-                  placeholder='{"key": "value"}'
+                  className="w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1 font-mono h-20 resize-y disabled:opacity-40"
+                  placeholder={editingAction.method === 'GET' ? 'GET requests send no body' : '{"key": "value"}'}
+                  disabled={editingAction.method === 'GET'}
                   value={editingAction.body}
                   onChange={e => setEditingAction({ ...editingAction, body: e.target.value })}
                 />
@@ -638,12 +746,12 @@ function PostMigrationActionsEditor({
               <div className="flex gap-2">
                 <button
                   className="bg-zinc-100 text-zinc-900 rounded px-3 py-1 font-medium disabled:opacity-40"
-                  disabled={!editingAction.url}
+                  disabled={!isHttpUrl(editingAction.url) || dupIds.size > 0}
                   onClick={commitEdit}
                 >
                   {editingIndex === null ? 'Add' : 'Save'}
                 </button>
-                <button className="text-zinc-500 hover:text-zinc-300" onClick={() => { setEditingAction(null); setEditingIndex(null); }}>cancel</button>
+                <button className="text-zinc-500 hover:text-zinc-300" onClick={closeEdit}>cancel</button>
               </div>
             </div>
           )}
@@ -651,7 +759,7 @@ function PostMigrationActionsEditor({
           {editingAction === null && (
             <button
               className="text-xs text-violet-400 hover:text-violet-300"
-              onClick={() => { setEditingAction({ ...blankAction }); setEditingIndex(null); }}
+              onClick={() => startEdit({ ...blankAction }, null)}
             >
               + add action
             </button>
@@ -668,6 +776,8 @@ function PostMigrationActionsEditor({
               </button>
             </div>
           )}
+
+          {actionError && <div className="text-xs text-red-400 break-all">{actionError}</div>}
 
           {runResults && (
             <div className="space-y-1">

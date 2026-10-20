@@ -20,6 +20,7 @@ export function FolderPicker({
   const [q, setQ] = useState('');
   const [debounced, setDebounced] = useState('');
   const [refreshing, setRefreshing] = useState(false);
+  const [reloadError, setReloadError] = useState<string | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -43,11 +44,16 @@ export function FolderPicker({
     staleTime: 60_000,
   });
 
+  // A forced reload never joins an in-flight listing, so it is blocked while the list is already loading.
   const reload = async (): Promise<void> => {
+    if (refreshing || results.isFetching) return;
     setRefreshing(true);
+    setReloadError(null);
     try {
       await api.searchFolders(instanceId, '', true);
       await qc.invalidateQueries({ queryKey: ['folders', instanceId] });
+    } catch (e) {
+      setReloadError(e instanceof Error ? e.message : 'reload failed');
     } finally {
       setRefreshing(false);
     }
@@ -61,7 +67,7 @@ export function FolderPicker({
       <div className="flex items-center gap-2 text-sm">
         <button
           type="button"
-          onClick={() => setOpen(v => !v)}
+          onClick={() => { setReloadError(null); setOpen(v => !v); }}
           className={`flex-1 text-left bg-zinc-950 border rounded px-2 py-1.5 truncate ${current ? 'border-zinc-700' : 'border-amber-700'}`}
         >
           {current ? (
@@ -91,12 +97,13 @@ export function FolderPicker({
               value={q}
               onChange={e => setQ(e.target.value)}
               onKeyDown={e => { if (e.key === 'Escape') setOpen(false); }}
+              maxLength={200}
               placeholder="Search folders by name or path"
               className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-sm"
             />
             <button
               type="button"
-              disabled={refreshing}
+              disabled={refreshing || results.isFetching}
               onClick={() => void reload()}
               title="Fetch the folder list again from Omni"
               className="text-xs text-zinc-500 hover:text-zinc-300 disabled:opacity-40"
@@ -104,6 +111,7 @@ export function FolderPicker({
               {refreshing ? 'reloading…' : 'reload'}
             </button>
           </div>
+          {reloadError && <div className="p-2 text-xs text-red-400 border-b border-zinc-800">Reload failed: {reloadError}</div>}
           <div className="max-h-72 overflow-auto">
             {results.isLoading && <div className="p-2 text-xs text-zinc-500">loading folders… (first load lists every folder)</div>}
             {results.error && <div className="p-2 text-xs text-red-400">{(results.error as Error).message}</div>}

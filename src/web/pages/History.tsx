@@ -3,15 +3,22 @@ import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 
 export default function History() {
-  const { data } = useQuery({ queryKey: ['jobs'], queryFn: api.listJobs });
-  const { data: instances } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
+  const { data, isLoading, error } = useQuery({ queryKey: ['jobs'], queryFn: api.listJobs });
+  const { data: instances, error: instancesError } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
 
   const instanceMap = new Map(instances?.map(i => [i.id, i.label]) ?? []);
 
   return (
     <div className="space-y-3">
       <h2 className="text-lg font-semibold">Migration history</h2>
-      {!data?.length && <div className="text-sm text-zinc-500">No jobs yet.</div>}
+      {instancesError && (
+        <div className="text-xs text-amber-300">Instance names unavailable (showing ids): {(instancesError as Error).message}</div>
+      )}
+      {isLoading && <div className="text-sm text-zinc-500">Loading…</div>}
+      {error && (
+        <div className="text-sm text-red-400">Failed to load history: {error instanceof Error ? error.message : 'unknown error'}</div>
+      )}
+      {data && data.length === 0 && <div className="text-sm text-zinc-500">No jobs yet.</div>}
       <ul className="space-y-2">
         {data?.map(j => {
           const destNames = j.destIds.map(id => instanceMap.get(id) ?? id.slice(0, 8)).join(', ');

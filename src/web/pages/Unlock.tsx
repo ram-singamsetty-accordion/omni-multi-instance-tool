@@ -1,15 +1,25 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 
 export default function Unlock({ vaultExists }: { vaultExists: boolean }) {
   const qc = useQueryClient();
   const [p, setP] = useState('');
+  const [confirm, setConfirm] = useState('');
   const [err, setErr] = useState<string | null>(null);
+  const mismatch = !vaultExists && confirm !== '' && confirm !== p;
   const m = useMutation({
-    mutationFn: (passphrase: string) => api.unlock(passphrase),
+    // Only the explicit "Create vault" form may create one; a missing file on Unlock is an error.
+    mutationFn: (passphrase: string) => api.unlock(passphrase, !vaultExists),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['unlock-status'] }),
-    onError: (e: Error) => setErr(e.message),
+    onError: (e: Error) => {
+      setErr(e.message);
+      // 409: the vault was created or removed since this form loaded, so refresh which form to show.
+      if (e instanceof ApiError && e.status === 409) {
+        setConfirm('');
+        qc.invalidateQueries({ queryKey: ['unlock-status'] });
+      }
+    },
   });
 
   return (
@@ -18,6 +28,7 @@ export default function Unlock({ vaultExists }: { vaultExists: boolean }) {
         className="bg-zinc-900 border border-zinc-800 rounded-lg p-6 w-96 space-y-4"
         onSubmit={e => {
           e.preventDefault();
+          if (!vaultExists && p !== confirm) return;
           setErr(null);
           m.mutate(p);
         }}
@@ -38,9 +49,19 @@ export default function Unlock({ vaultExists }: { vaultExists: boolean }) {
           className="w-full bg-zinc-950 border border-zinc-700 rounded px-3 py-2 text-zinc-100"
           placeholder="passphrase"
         />
+        {!vaultExists && (
+          <input
+            type="password"
+            value={confirm}
+            onChange={e => setConfirm(e.target.value)}
+            className="w-full bg-zinc-950 border border-zinc-700 rounded px-3 py-2 text-zinc-100"
+            placeholder="confirm passphrase"
+          />
+        )}
+        {mismatch && <div className="text-sm text-red-400">Passphrases do not match</div>}
         {err && <div className="text-sm text-red-400">{err}</div>}
         <button
-          disabled={m.isPending || !p}
+          disabled={m.isPending || !p || (!vaultExists && p !== confirm)}
           className="w-full bg-zinc-100 text-zinc-900 rounded py-2 font-medium disabled:opacity-40"
         >
           {m.isPending ? 'unlocking…' : vaultExists ? 'Unlock' : 'Create'}

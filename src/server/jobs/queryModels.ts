@@ -110,36 +110,46 @@ function viewNameOf(fileName: string): string {
   return fileName.slice(0, -QUERY_VIEW_SUFFIX.length).split('/').pop() ?? fileName;
 }
 
-/** Reads the `query.fields` block of a query-view file: source field → output column alias. */
+/**
+ * Reads the `query.fields` block of a query-view file: source field → output column alias.
+ * Keys and values may be quoted, and comment lines or trailing comments are ignored.
+ */
 export function parseQueryViewAliases(yaml: string): Record<string, string> {
   const aliases: Record<string, string> = {};
   const lines = yaml.split(/\r?\n/);
   let inQuery = false;
   let inFields = false;
   for (const line of lines) {
+    if (/^\s*(#.*)?$/.test(line)) continue; // blank and comment lines never end a block
     if (/^\S/.test(line)) {
-      inQuery = /^query:\s*$/.test(line);
+      inQuery = /^query:\s*(#.*)?$/.test(line);
       inFields = false;
       continue;
     }
     if (!inQuery) continue;
     if (/^ {2}\S/.test(line)) {
-      inFields = /^ {2}fields:\s*$/.test(line);
+      inFields = /^ {2}fields:\s*(#.*)?$/.test(line);
       continue;
     }
     if (!inFields) continue;
-    const m = line.match(/^ {4}([A-Za-z_][\w.[\]]*):\s*([A-Za-z_]\w*)\s*$/);
-    if (m) aliases[m[1]!] = m[2]!;
+    const m = line.match(/^ {4}(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\w.[\]]*)):\s*["']?([A-Za-z_]\w*)["']?\s*(?:#.*)?$/);
+    if (m) aliases[(m[1] ?? m[2] ?? m[3])!] = m[4]!;
   }
   return aliases;
 }
 
-const RAW_COLUMN_REF = /(?:"([A-Za-z_]\w*)"\.)?"([A-Za-z_]\w*\.[A-Za-z_]\w*)"/g;
+const RAW_COLUMN_REF = /(?:"([A-Za-z_]\w*)"\.)?"([A-Za-z_]\w*\.[A-Za-z_]\w*(?:\[[A-Za-z_]\w*\])?)"/g;
+
+// A quoted YAML key (`"view.field": alias`) is a field declaration, not a column reference inside SQL.
+function isQuotedYamlKey(text: string, start: number, end: number): boolean {
+  return /^[ \t]*:(?!:)/.test(text.slice(end)) && text.slice(text.lastIndexOf('\n', start - 1) + 1, start).trim() === '';
+}
 
 /**
  * Rewrites raw CTE column references to Omni field references so they survive re-creation from YAML:
- *   "cte"."view.field"  → ${cte.alias}    (any file)
- *   "view.field"        → ${self.alias}   (only inside the CTE's own .query.view file)
+ *   "cte"."view.field"             → ${cte.alias}    (any file)
+ *   "cte"."view.field[timeframe]"  → ${cte.alias}    (any file)
+ *   "view.field"                   → ${self.alias}   (only inside the CTE's own .query.view file)
  * References with no known alias are left unchanged and reported.
  */
 export function fixRawColumnRefs(files: Record<string, string>): { files: Record<string, string>; changed: string[]; unresolved: string[] } {
@@ -152,9 +162,9 @@ export function fixRawColumnRefs(files: Record<string, string>): { files: Record
   const unresolved: string[] = [];
   for (const [fileName, yaml] of Object.entries(files)) {
     const self = fileName.endsWith(QUERY_VIEW_SUFFIX) ? viewNameOf(fileName) : null;
-    const next = yaml.replace(RAW_COLUMN_REF, (whole, cte: string | undefined, field: string) => {
+    const next = yaml.replace(RAW_COLUMN_REF, (whole, cte: string | undefined, field: string, offset: number, text: string) => {
       const view = cte ?? self;
-      if (!view) return whole;
+      if (!view || isQuotedYamlKey(text, offset, offset + whole.length)) return whole;
       const alias = aliasesByView.get(view)?.[field];
       if (!alias) {
         // A qualified ref to a non-CTE table is ordinary SQL; only report refs into a known CTE.
@@ -172,6 +182,11 @@ export function fixRawColumnRefs(files: Record<string, string>): { files: Record
 function isEmptyDefault(fileName: string, yaml: string): boolean {
   const body = yaml.trim();
   return (fileName === 'model' && body === '{}') || (fileName === 'relationships' && body === '[]');
+}
+
+/** True when a query model's extension files hold anything beyond the empty defaults (tab-only fields, CTEs). */
+export function hasAuthoredContent(files: Record<string, string>): boolean {
+  return Object.entries(files).some(([name, yaml]) => !isEmptyDefault(name, yaml));
 }
 
 // View and query-view files first, then relationships, then topics (topics reference the views).
@@ -229,11 +244,22 @@ export interface VerifyResult {
   checked: number;
   failures: { tile: string; error: string }[];
   timeouts: string[];
+  unverified: { tile: string; reason: string }[];
 }
 
-/** Runs each tile's query (limit 5) on the target. A 400 means the tile cannot compile, i.e. it is broken. */
+// Errors that say nothing about the tile: auth/permission, rate limit, gateway/unavailable, transport failures.
+// 500 stays a tile failure (documented 'Query execution error'); 400 and 404 are genuine tile failures too.
+function isUnverifiable(err: unknown): boolean {
+  if (!(err instanceof OmniError)) return true;
+  return [401, 403, 429, 502, 503, 504].includes(err.status);
+}
+
+/**
+ * Runs each tile's query (limit 5) on the target. A 400 means the tile cannot compile, i.e. it is broken.
+ * A timeout, or an error unrelated to the tile (auth, rate limit, gateway, network), leaves it unverified.
+ */
 export async function verifyTiles(client: OmniClient, imported: OmniExportPayload, opts: { environmentConnectionId?: string; onlyTileNames?: Set<string> } = {}): Promise<VerifyResult> {
-  const result: VerifyResult = { checked: 0, failures: [], timeouts: [] };
+  const result: VerifyResult = { checked: 0, failures: [], timeouts: [], unverified: [] };
   const { onlyTileNames, ...runOpts } = opts;
   for (const tile of listTiles(imported)) {
     if (onlyTileNames && !onlyTileNames.has(tile.name)) continue;
@@ -244,6 +270,10 @@ export async function verifyTiles(client: OmniClient, imported: OmniExportPayloa
     } catch (err) {
       if (err instanceof OmniError && err.status === 408) {
         result.timeouts.push(tile.name);
+        continue;
+      }
+      if (isUnverifiable(err)) {
+        result.unverified.push({ tile: tile.name, reason: extractQueryError(err) });
         continue;
       }
       result.failures.push({ tile: tile.name, error: extractQueryError(err) });

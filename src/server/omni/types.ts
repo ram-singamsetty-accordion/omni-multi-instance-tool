@@ -98,8 +98,8 @@ export interface OmniLabelRecord {
   name: string;
   color?: string | null;
   description?: string | null;
-  isVerified?: boolean;
-  isHomepageSection?: boolean;
+  verified?: boolean;
+  homepage?: boolean;
 }
 
 export interface OmniLabelsListResponse {
@@ -120,7 +120,7 @@ export interface OmniConnection {
   id: string;
   name: string;
   dialect: string;
-  database: string;
+  database: string | null;
   baseRole?: string;
   deletedAt?: string | null;
   defaultSchema?: string;

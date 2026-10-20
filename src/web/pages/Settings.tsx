@@ -17,6 +17,12 @@ function ChangePassphrase() {
   const [status, setStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [error, setError] = useState('');
 
+  // Editing any field clears a previous 'updated' or error message.
+  const touch = (set: (v: string) => void) => (v: string): void => {
+    set(v);
+    setStatus(s => (s === 'loading' ? s : 'idle'));
+  };
+
   const mismatch = next && confirm && next !== confirm;
   const canSubmit = current && next && confirm && !mismatch && status !== 'loading';
 
@@ -44,12 +50,12 @@ function ChangePassphrase() {
         <p className="text-xs text-zinc-500 mt-0.5">Re-encrypts the vault with a new passphrase. The current session stays active.</p>
       </div>
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-        <PassField label="Current passphrase" value={current} onChange={setCurrent} />
-        <PassField label="New passphrase" value={next} onChange={setNext} />
+        <PassField label="Current passphrase" value={current} onChange={touch(setCurrent)} />
+        <PassField label="New passphrase" value={next} onChange={touch(setNext)} />
         <PassField
           label="Confirm new passphrase"
           value={confirm}
-          onChange={v => { setConfirm(v); if (status === 'error') setStatus('idle'); }}
+          onChange={touch(setConfirm)}
           error={mismatch ? 'Passphrases do not match' : undefined}
         />
         <div className="flex items-center gap-3 pt-1">

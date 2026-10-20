@@ -75,6 +75,10 @@ export interface OmniLabel {
 }
 
 export type JobItemKind = 'delete' | 'export' | 'import' | 'update' | 'models' | 'verify' | 'meta';
+// Failed steps a retry can redo. Not models/verify: a retry re-plans against what is now on the
+// destination, so a dashboard that landed becomes an update, which never rebuilds query models and
+// would report a false green.
+export const RETRYABLE_ITEM_KINDS: readonly JobItemKind[] = ['delete', 'export', 'import', 'update', 'meta'];
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
 export type JobStatus =
   | 'pending'
@@ -136,12 +140,16 @@ export interface JobPlan {
   docIds: string[];
   emptyFirst: boolean;
   steps: JobPlanStep[];
+  // Hash of the steps. Execute sends the digest of the plan the user reviewed and is refused when a
+  // fresh plan differs, so destination changes since the preview never run unreviewed.
+  digest: string;
 }
 
 export interface JobEvent {
   jobId: string;
   itemId?: string;
-  type: 'item' | 'job' | 'post-migration';
+  // 'done' is the last event of a stream: the job is no longer running and the server ends the response.
+  type: 'item' | 'job' | 'post-migration' | 'done';
   status: JobItemStatus | JobStatus | 'done';
   error?: string;
   at: number;

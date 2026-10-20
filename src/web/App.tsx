@@ -1,6 +1,8 @@
-import { Route, Routes, NavLink, Navigate, useNavigate } from 'react-router-dom';
+import { useEffect, useLayoutEffect, useRef } from 'react';
+import { Route, Routes, NavLink, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './lib/api';
+import { clearDashboardCaches } from './lib/dashboardCache';
 import Unlock from './pages/Unlock';
 import Dashboard from './pages/Dashboard';
 import Instances from './pages/Instances';
@@ -13,12 +15,45 @@ import Settings from './pages/Settings';
 export default function App() {
   const qc = useQueryClient();
   const nav = useNavigate();
-  const { data, isLoading } = useQuery({
+  const mainRef = useRef<HTMLElement>(null);
+  const { pathname } = useLocation();
+  // <main> is the scroll container (the window never scrolls), so reset it on navigation.
+  useLayoutEffect(() => { mainRef.current?.scrollTo(0, 0); }, [pathname]);
+  // Retries ride out the dev-server startup race.
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ['unlock-status'],
     queryFn: api.unlockStatus,
+    retry: 8,
+    retryDelay: 500,
   });
 
+  // Covers the Lock button, a server restart and a lock from another tab: the localStorage dashboard snapshot holds
+  // every embed user's email, so drop it and every cached query. Not qc.clear(): Unlock invalidates 'unlock-status'.
+  const unlocked = data?.unlocked;
+  useEffect(() => {
+    if (unlocked === false) {
+      clearDashboardCaches();
+      qc.removeQueries({ predicate: q => q.queryKey[0] !== 'unlock-status' });
+    }
+  }, [unlocked, qc]);
+
   if (isLoading) return <div className="p-8 text-zinc-400">loading…</div>;
+
+  // A failed background refetch keeps `data`; only fall back to the error screen when there is nothing to show.
+  if (isError && !data) {
+    return (
+      <div className="p-8 space-y-3">
+        <div className="text-sm text-red-400">Cannot reach the server. {(error as Error).message}</div>
+        <button
+          className="text-sm underline text-zinc-300 disabled:opacity-40"
+          disabled={isFetching}
+          onClick={() => void refetch()}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
 
   if (!data?.unlocked) return <Unlock vaultExists={data?.vaultExists ?? false} />;
 
@@ -52,7 +87,7 @@ export default function App() {
           </button>
         </div>
       </aside>
-      <main className="flex-1 overflow-auto p-6">
+      <main ref={mainRef} className="flex-1 overflow-auto p-6">
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard />} />
@@ -62,6 +97,8 @@ export default function App() {
           <Route path="/jobs/:id" element={<JobDetail />} />
           <Route path="/history" element={<History />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/jobs" element={<Navigate to="/history" replace />} />
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </main>
     </div>

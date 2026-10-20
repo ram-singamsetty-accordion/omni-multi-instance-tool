@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
+import { resetDashboardCache } from '../lib/dashboardCache';
 import type { DashboardFilter, Instance, InstancePublic, InstanceRole } from '../../shared/types';
 
 type DashboardTab = 'connections' | 'users';
@@ -24,13 +25,18 @@ const blank: Omit<Instance, 'id'> = {
 
 export default function Instances() {
   const qc = useQueryClient();
-  const { data: instances } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
+  const { data: instances, isLoading, error: loadError } = useQuery({ queryKey: ['instances'], queryFn: api.listInstances });
   const [form, setForm] = useState<Omit<Instance, 'id'> & { id?: string }>(blank);
 
   const setTabs = useMutation({
     mutationFn: ({ id, tabs }: { id: string; tabs: DashboardTab[] }) =>
       api.setInstanceDashboardTabs(id, tabs),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['instances'] }),
+    // Resetting an observer detaches its in-flight mutation, so only clear a finished one.
+    onMutate: () => { if (!del.isPending) del.reset(); },
+    onSuccess: () => {
+      resetDashboardCache(qc);
+      return qc.invalidateQueries({ queryKey: ['instances'] });
+    },
   });
 
   const toggleTab = (inst: InstancePublic, tab: DashboardTab) => {
@@ -44,8 +50,8 @@ export default function Instances() {
     mutationFn: ({ id, filter }: { id: string; filter: DashboardFilter }) =>
       api.setInstanceDashboardFilter(id, filter),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['dashboard-stats'] });
-      qc.invalidateQueries({ queryKey: ['dashboard-embed-users'] });
+      resetDashboardCache(qc);
+      return qc.invalidateQueries({ queryKey: ['instances'] });
     },
   });
   const saveFilterFor = (id: string, filter: DashboardFilter) =>
@@ -55,6 +61,7 @@ export default function Instances() {
     onSuccess: () => {
       setForm(blank);
       qc.invalidateQueries({ queryKey: ['instances'] });
+      resetDashboardCache(qc);
     },
   });
   const update = useMutation({
@@ -62,20 +69,38 @@ export default function Instances() {
     onSuccess: () => {
       setForm(blank);
       qc.invalidateQueries({ queryKey: ['instances'] });
+      resetDashboardCache(qc);
     },
   });
   const del = useMutation({
     mutationFn: (id: string) => api.deleteInstance(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['instances'] }),
+    onMutate: () => { if (!setTabs.isPending) setTabs.reset(); },
+    onSuccess: (_d, id) => {
+      setForm(f => (f.id === id ? blank : f));
+      qc.invalidateQueries({ queryKey: ['instances'] });
+      resetDashboardCache(qc);
+    },
   });
 
+  const formError = form.id ? update.error : create.error;
+  const listError = del.error ?? setTabs.error;
+
   const submit = (): void => {
+    if (create.isPending || update.isPending) return;
     const { id, ...body } = form;
     if (id) update.mutate({ id, b: body });
     else create.mutate(body);
   };
 
+  const cancelEdit = (): void => {
+    create.reset();
+    update.reset();
+    setForm(blank);
+  };
+
   const startEdit = (i: InstancePublic): void => {
+    create.reset();
+    update.reset();
     setForm({
       id: i.id,
       label: i.label,
@@ -95,6 +120,13 @@ export default function Instances() {
       <section>
         <h2 className="text-lg font-medium mb-3">Instances</h2>
         <div className="space-y-2">
+          {listError && (
+            <div className="text-xs text-red-400 break-words whitespace-pre-wrap mb-2">{listError.message}</div>
+          )}
+          {isLoading && <div className="text-sm text-zinc-500">loading…</div>}
+          {loadError && (
+            <div className="text-sm text-red-400 break-words whitespace-pre-wrap">{(loadError as Error).message}</div>
+          )}
           {instances?.map(i => (
             <div key={i.id} className="bg-zinc-900 border border-zinc-800 rounded text-sm">
               <div className="p-3 flex items-center gap-3">
@@ -112,8 +144,9 @@ export default function Instances() {
                       <button
                         key={tab}
                         onClick={() => toggleTab(i, tab)}
+                        disabled={setTabs.isPending}
                         title={on ? `Hide from ${tab} tab` : `Show in ${tab} tab`}
-                        className={`text-xs px-1.5 py-0.5 rounded border transition-colors ${
+                        className={`text-xs px-1.5 py-0.5 rounded border transition-colors disabled:opacity-60 ${
                           on
                             ? 'border-emerald-800 text-emerald-400 hover:border-emerald-600'
                             : 'border-zinc-800 text-zinc-600 hover:text-zinc-400'
@@ -161,7 +194,7 @@ export default function Instances() {
           </div>
           <Field label="Base URL" value={form.baseUrl} onChange={v => setForm({ ...form, baseUrl: v })} placeholder="https://acme.omniapp.co" />
           <Field
-            label={form.id ? 'API Key (leave blank to keep existing)' : 'API Key'}
+            label={form.id ? 'API Key (leave blank to keep existing; required if you change the Base URL)' : 'API Key'}
             value={form.apiKey}
             onChange={v => setForm({ ...form, apiKey: v })}
             type="password"
@@ -170,21 +203,24 @@ export default function Instances() {
           <Field label="Base Model ID (for import)" value={form.modelId} onChange={v => setForm({ ...form, modelId: v })} />
           <Field label="Folder ID (for list / delete)" value={form.folderId} onChange={v => setForm({ ...form, folderId: v })} />
           <Field label="Folder Path (for import target)" value={form.folderPath} onChange={v => setForm({ ...form, folderPath: v })} placeholder="Marketing/Imported" />
-          <Field label="Entity group separator (optional)" value={form.entityGroupSeparator ?? ''} onChange={v => setForm({ ...form, entityGroupSeparator: v || undefined })} placeholder="e.g.  | " />
+          <Field label="Entity group separator (optional)" value={form.entityGroupSeparator ?? ''} onChange={v => setForm({ ...form, entityGroupSeparator: v })} placeholder="e.g.  | " />
           <div className="flex gap-2 pt-2">
             <button
               className="bg-zinc-100 text-zinc-900 rounded px-4 py-1.5 font-medium disabled:opacity-40"
-              disabled={!form.label || !form.baseUrl || (!form.id && !form.apiKey)}
+              disabled={create.isPending || update.isPending || !form.label.trim() || !form.baseUrl.trim() || (!form.id && !form.apiKey.trim())}
               onClick={submit}
             >
               {form.id ? 'Save' : 'Create'}
             </button>
             {form.id && (
-              <button className="text-xs text-zinc-400" onClick={() => setForm(blank)}>
+              <button className="text-xs text-zinc-400" onClick={cancelEdit}>
                 cancel
               </button>
             )}
           </div>
+          {formError && (
+            <div className="text-xs text-red-400 break-words whitespace-pre-wrap">{formError.message}</div>
+          )}
         </div>
       </section>
     </div>
@@ -198,11 +234,30 @@ function parsePatterns(input: string, mode: MatchMode): FilterPattern[] {
   return input.split(',').map(s => s.trim()).filter(Boolean).map(value => ({ value, mode }));
 }
 
+function dedupePatterns(list: FilterPattern[]): FilterPattern[] {
+  const seen = new Set<string>();
+  return list.filter(p => {
+    const k = `${p.mode}:${p.value}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function initPatterns(contains: string[] = [], exact: string[] = []): FilterPattern[] {
-  return [
+  return dedupePatterns([
     ...contains.map(value => ({ value, mode: 'contains' as MatchMode })),
     ...exact.map(value => ({ value, mode: 'exact' as MatchMode })),
-  ];
+  ]);
+}
+
+function toFilter(db: FilterPattern[], ids: FilterPattern[]): DashboardFilter {
+  return {
+    databaseContains: db.filter(p => p.mode === 'contains').map(p => p.value),
+    databaseExact: db.filter(p => p.mode === 'exact').map(p => p.value),
+    externalIdContains: ids.filter(p => p.mode === 'contains').map(p => p.value),
+    externalIdExact: ids.filter(p => p.mode === 'exact').map(p => p.value),
+  };
 }
 
 function PatternChips({
@@ -218,7 +273,7 @@ function PatternChips({
         <span key={`${p.mode}:${p.value}`} className="flex items-center gap-1 bg-zinc-800 text-zinc-300 rounded px-1.5 py-0.5">
           <button
             title={p.mode === 'contains' ? 'Switch to exact match' : 'Switch to contains match'}
-            onClick={() => onChange(patterns.map((x, j) => j === i ? { ...x, mode: x.mode === 'contains' ? 'exact' : 'contains' } : x))}
+            onClick={() => onChange(dedupePatterns(patterns.map((x, j) => j === i ? { ...x, mode: x.mode === 'contains' ? 'exact' : 'contains' } : x)))}
             className={`font-mono text-[10px] px-0.5 rounded ${p.mode === 'contains' ? 'text-zinc-500 hover:text-zinc-300' : 'text-blue-400 hover:text-blue-300'}`}
           >
             {p.mode === 'contains' ? '~' : '='}
@@ -228,6 +283,24 @@ function PatternChips({
         </span>
       ))}
     </div>
+  );
+}
+
+function ModeToggle({ mode, onChange }: { mode: MatchMode; onChange: (m: MatchMode) => void }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={mode === 'exact'}
+      title={mode === 'contains' ? 'Contains match — click for exact' : 'Exact match — click for contains'}
+      onClick={() => onChange(mode === 'contains' ? 'exact' : 'contains')}
+      className={`shrink-0 px-2 py-1 rounded border text-[10px] font-mono transition-colors ${
+        mode === 'contains'
+          ? 'border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300'
+          : 'border-blue-700 text-blue-400 hover:border-blue-500'
+      }`}
+    >
+      {mode === 'contains' ? '~contains' : '=exact'}
+    </button>
   );
 }
 
@@ -251,54 +324,57 @@ function FilterEditor({
   const [idMode, setIdMode] = useState<MatchMode>('contains');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
 
-  const totalPatterns = dbPatterns.length + idPatterns.length;
+  // Re-seed the draft whenever the server value changes (own save, or a stale cache refreshing).
+  // Keyed on the serialised filter so unrelated list refetches do not wipe unsaved edits.
+  const serverKey = JSON.stringify(instance.dashboardFilter ?? null);
+  useEffect(() => {
+    setDbPatterns(initPatterns(instance.dashboardFilter?.databaseContains, instance.dashboardFilter?.databaseExact));
+    setIdPatterns(initPatterns(instance.dashboardFilter?.externalIdContains, instance.dashboardFilter?.externalIdExact));
+  }, [serverKey]);
+
+  // Text typed but not yet added still counts: Update filter saves it too.
+  const draftDb = dedupePatterns([...dbPatterns, ...parsePatterns(dbInput, dbMode)]);
+  const draftIds = dedupePatterns([...idPatterns, ...parsePatterns(idInput, idMode)]);
+  const savedFilter = toFilter(
+    initPatterns(instance.dashboardFilter?.databaseContains, instance.dashboardFilter?.databaseExact),
+    initPatterns(instance.dashboardFilter?.externalIdContains, instance.dashboardFilter?.externalIdExact)
+  );
+  const savedCount = Object.values(savedFilter).reduce((n, a) => n + a.length, 0);
+  const dirty = JSON.stringify(toFilter(draftDb, draftIds)) !== JSON.stringify(savedFilter);
 
   const addDb = () => {
-    const incoming = parsePatterns(dbInput, dbMode);
-    if (incoming.length) setDbPatterns(p => [...p, ...incoming.filter(v => !p.some(x => x.value === v.value && x.mode === v.mode))]);
+    setDbPatterns(p => dedupePatterns([...p, ...parsePatterns(dbInput, dbMode)]));
     setDbInput('');
   };
   const addId = () => {
-    const incoming = parsePatterns(idInput, idMode);
-    if (incoming.length) setIdPatterns(p => [...p, ...incoming.filter(v => !p.some(x => x.value === v.value && x.mode === v.mode))]);
+    setIdPatterns(p => dedupePatterns([...p, ...parsePatterns(idInput, idMode)]));
     setIdInput('');
   };
 
   const handleSave = async () => {
+    setDbPatterns(draftDb);
+    setIdPatterns(draftIds);
+    setDbInput('');
+    setIdInput('');
     setSaving(true);
     setSaved(false);
+    setErr(null);
     try {
-      await onSave({
-        databaseContains: dbPatterns.filter(p => p.mode === 'contains').map(p => p.value),
-        databaseExact: dbPatterns.filter(p => p.mode === 'exact').map(p => p.value),
-        externalIdContains: idPatterns.filter(p => p.mode === 'contains').map(p => p.value),
-        externalIdExact: idPatterns.filter(p => p.mode === 'exact').map(p => p.value),
-      });
+      await onSave(toFilter(draftDb, draftIds));
       setSaved(true);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed');
     } finally {
       setSaving(false);
     }
   };
-
-  const ModeToggle = ({ mode, onChange }: { mode: MatchMode; onChange: (m: MatchMode) => void }) => (
-    <button
-      type="button"
-      title={mode === 'contains' ? 'Contains match — click for exact' : 'Exact match — click for contains'}
-      onClick={() => onChange(mode === 'contains' ? 'exact' : 'contains')}
-      className={`shrink-0 px-2 py-1 rounded border text-[10px] font-mono transition-colors ${
-        mode === 'contains'
-          ? 'border-zinc-700 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300'
-          : 'border-blue-700 text-blue-400 hover:border-blue-500'
-      }`}
-    >
-      {mode === 'contains' ? '~contains' : '=exact'}
-    </button>
-  );
 
   return (
     <div className="border-t border-zinc-800">
@@ -308,7 +384,8 @@ function FilterEditor({
       >
         <span>{open ? '▾' : '▸'}</span>
         <span>skip filters</span>
-        {totalPatterns > 0 && <span className="text-zinc-600">({totalPatterns} active)</span>}
+        {savedCount > 0 && <span className="text-zinc-600">({savedCount} active)</span>}
+        {dirty && <span className="text-amber-400">unsaved changes</span>}
       </button>
       {open && (
         <div className="px-3 pb-3 space-y-3 text-xs">
@@ -361,13 +438,14 @@ function FilterEditor({
               {saving ? 'saving…' : 'Update filter'}
             </button>
             <button
-              onClick={() => { setDbPatterns([]); setIdPatterns([]); }}
-              disabled={saving || totalPatterns === 0}
+              onClick={() => { setDbPatterns([]); setIdPatterns([]); setDbInput(''); setIdInput(''); }}
+              disabled={saving || draftDb.length + draftIds.length === 0}
               className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded disabled:opacity-40"
             >
               Clear all filters
             </button>
             {saved && <span className="text-emerald-400">Saved</span>}
+            {err && <span className="text-red-400 break-words min-w-0">{err}</span>}
           </div>
         </div>
       )}

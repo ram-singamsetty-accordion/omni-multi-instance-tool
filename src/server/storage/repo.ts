@@ -79,6 +79,18 @@ export interface CreateJobRow {
   destFolders?: Record<string, FolderRef>;
 }
 
+const REDACTED = '********';
+
+// The vault is the only encrypted store and the jobs table is plaintext SQLite, so header values and
+// bodies (tokens) are never written to it. The run itself uses the real actions passed in memory.
+function redactActions(actions: PostMigrationAction[]): PostMigrationAction[] {
+  return actions.map(a => ({
+    ...a,
+    headers: Object.fromEntries(Object.keys(a.headers ?? {}).map(k => [k, REDACTED])),
+    body: a.body ? REDACTED : '',
+  }));
+}
+
 export function createJob(input: CreateJobRow): Job {
   const db = getDb();
   const id = randomUUID();
@@ -97,7 +109,7 @@ export function createJob(input: CreateJobRow): Job {
     input.emptyFirst ? 1 : 0,
     now,
     input.parentJobId ?? null,
-    actions.length > 0 ? JSON.stringify(actions) : null,
+    actions.length > 0 ? JSON.stringify(redactActions(actions)) : null,
     sourceFolder ? JSON.stringify(sourceFolder) : null,
     Object.keys(destFolders).length > 0 ? JSON.stringify(destFolders) : null,
   );
@@ -202,4 +214,31 @@ export function getItems(jobId: string): JobItem[] {
 export function getFailedItems(jobId: string): JobItem[] {
   const rows = getDb().prepare(`SELECT * FROM job_items WHERE job_id = ? AND status = 'failed'`).all(jobId) as ItemRow[];
   return rows.map(rowToItem);
+}
+
+// Job state only advances in memory, so a server stop leaves jobs 'running' and their unfinished
+// items 'running'/'pending'. Called once at startup: marks those items failed (so Retry can pick
+// them up) and gives each job the status its items imply. Returns the number of jobs closed.
+export function failInterruptedJobs(): number {
+  const db = getDb();
+  const now = Date.now();
+  const txn = db.transaction((): number => {
+    db.prepare(`
+      UPDATE job_items SET status = 'failed', ended_at = ?,
+        error = CASE status
+          WHEN 'running' THEN 'interrupted: the server stopped while this step was running; check the destination for a partial result before retrying'
+          ELSE 'interrupted: the server stopped before this step ran'
+        END
+      WHERE status IN ('running', 'pending') AND job_id IN (SELECT id FROM jobs WHERE status IN ('pending', 'running'))
+    `).run(now);
+    return db.prepare(`
+      UPDATE jobs SET ended_at = ?, status = CASE
+        WHEN EXISTS (SELECT 1 FROM job_items i WHERE i.job_id = jobs.id AND i.status = 'failed')
+          THEN CASE WHEN EXISTS (SELECT 1 FROM job_items i WHERE i.job_id = jobs.id AND i.status IN ('succeeded', 'skipped')) THEN 'partial' ELSE 'failed' END
+        ELSE 'succeeded'
+      END
+      WHERE status IN ('pending', 'running')
+    `).run(now).changes;
+  });
+  return txn();
 }

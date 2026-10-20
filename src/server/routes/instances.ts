@@ -1,18 +1,29 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { deleteInstance, getInstance, isUnlocked, listInstances, upsertInstance, setInstanceActions, setInstanceDashboardTabs, setInstanceDashboardFilter, changePassphrase } from '../storage/vault.js';
+import { deleteInstance, getInstance, isUnlocked, listInstances, upsertInstance, setInstanceActions, setInstanceDashboardTabs, setInstanceDashboardFilter, changePassphrase, toPublic } from '../storage/vault.js';
+import { normalizeBaseUrl } from '../storage/baseUrl.js';
+import { httpError } from '../httpError.js';
 
 const instanceBody = z.object({
   id: z.string().uuid().optional(),
-  label: z.string().min(1),
+  label: z.string().trim().min(1),
   role: z.enum(['source', 'destination']),
-  baseUrl: z.string().url(),
-  apiKey: z.string(),
-  userId: z.string().default(''),
-  modelId: z.string().default(''),
-  folderId: z.string().default(''),
-  folderPath: z.string().default(''),
-  entityGroupSeparator: z.string().optional(),
+  baseUrl: z.string().transform((s, ctx) => {
+    try {
+      return normalizeBaseUrl(s);
+    } catch (e) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: e instanceof Error ? e.message : 'invalid base URL' });
+      return z.NEVER;
+    }
+  }),
+  // Empty keeps the stored key on update (the UI sends '' unless the user typed one); create requires one.
+  apiKey: z.string().trim().regex(/^[\x21-\x7e]*$/, 'API key must be printable ASCII without spaces').default(''),
+  userId: z.string().trim().default(''),
+  modelId: z.string().trim().default(''),
+  folderId: z.string().trim().default(''),
+  folderPath: z.string().trim().default(''),
+  // Not trimmed: a separator such as ' | ' is meaningful. '' clears it.
+  entityGroupSeparator: z.string().default(''),
 });
 
 function requireUnlocked(): void {
@@ -28,6 +39,7 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/instances', async req => {
     requireUnlocked();
     const body = instanceBody.parse(req.body);
+    if (!body.id && !body.apiKey) throw httpError('apiKey is required', 400);
     return upsertInstance(body);
   });
 
@@ -83,7 +95,10 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
-  app.post('/api/settings/change-passphrase', async (req, reply) => {
+  // Verifies the current passphrase, so it needs the same tight limit as /api/unlock.
+  app.post('/api/settings/change-passphrase', {
+    config: { rateLimit: { max: 5, timeWindow: '5 minutes' } },
+  }, async (req, reply) => {
     requireUnlocked();
     const { currentPassphrase, newPassphrase } = z.object({
       currentPassphrase: z.string().min(1),
@@ -109,9 +124,7 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
     requireUnlocked();
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
     const inst = getInstance(id);
-    if (!inst) return { error: 'not found' };
-    const { apiKey: _apiKey, ...rest } = inst;
-    void _apiKey;
-    return { ...rest, apiKeyMasked: inst.apiKey ? `${inst.apiKey.slice(0, 4)}••••${inst.apiKey.slice(-4)}` : '' };
+    if (!inst) throw httpError('instance not found', 404);
+    return toPublic(inst);
   });
 }

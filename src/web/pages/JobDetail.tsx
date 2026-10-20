@@ -3,44 +3,63 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../lib/api';
 import { streamJob } from '../lib/sse';
+import { RETRYABLE_ITEM_KINDS } from '../../shared/types';
 import type { JobItem, JobItemStatus, PostMigrationActionResult } from '../../shared/types';
 
 export default function JobDetail() {
   const { id = '' } = useParams();
   const qc = useQueryClient();
   const nav = useNavigate();
-  const { data } = useQuery({
+  const validId = /^[0-9a-f-]{36}$/i.test(id);
+  const { data, error } = useQuery({
     queryKey: ['job', id],
     queryFn: () => api.getJob(id),
+    enabled: validId,
+    // Safety net if the event stream drops: keep polling while the server says the job is running.
+    refetchInterval: q => (q.state.data?.running ? 3000 : false),
   });
-  const [liveItems, setLiveItems] = useState<Record<string, Partial<JobItem>>>({});
+  // `at` is the server timestamp of the event, compared with the row's own timestamps below.
+  const [liveItems, setLiveItems] = useState<Record<string, { status: JobItemStatus; error: string | null; at: number }>>({});
   const [postMigrationRunning, setPostMigrationRunning] = useState(false);
 
   useEffect(() => {
-    if (!id) return;
+    if (!validId) return;
+    const refetch = (): void => { void qc.invalidateQueries({ queryKey: ['job', id] }); };
     const stop = streamJob(id, evt => {
       if (evt.type === 'item' && evt.itemId) {
         setLiveItems(prev => ({
           ...prev,
-          [evt.itemId!]: { status: evt.status as JobItemStatus, error: evt.error ?? null },
+          [evt.itemId!]: { status: evt.status as JobItemStatus, error: evt.error ?? null, at: evt.at },
         }));
       } else if (evt.type === 'job') {
-        qc.invalidateQueries({ queryKey: ['job', id] });
+        refetch();
       } else if (evt.type === 'post-migration') {
         if (evt.status === 'running') {
           setPostMigrationRunning(true);
         } else {
           setPostMigrationRunning(false);
-          qc.invalidateQueries({ queryKey: ['job', id] });
+          refetch();
         }
+      } else if (evt.type === 'done') {
+        // The run is over (also sent right away for a job that is not running): clear a post-migration
+        // 'running' flag whose end event was missed, and pick up the final state.
+        setPostMigrationRunning(false);
+        refetch();
       }
-    });
+    }, undefined, refetch);
     return stop;
-  }, [id, qc]);
+  }, [id, validId, qc]);
 
+  // A live event only wins over the fetched row while it is newer than the row's last write; otherwise a
+  // missed or reordered event would leave a stale 'running' row on screen.
   const items = useMemo<JobItem[]>(() => {
     if (!data) return [];
-    return data.items.map(i => ({ ...i, ...(liveItems[i.id] ?? {}) }));
+    return data.items.map(i => {
+      const live = liveItems[i.id];
+      if (!live) return i;
+      const rowAt = Math.max(i.startedAt ?? 0, i.endedAt ?? 0);
+      return live.at > rowAt ? { ...i, status: live.status, error: live.error } : i;
+    });
   }, [data, liveItems]);
 
   const retry = useMutation({
@@ -48,9 +67,21 @@ export default function JobDetail() {
     onSuccess: ({ job }) => nav(`/jobs/${job.id}`),
   });
 
-  if (!data) return <div className="text-sm text-zinc-500">loading…</div>;
+  if (!validId) return <div className="text-sm text-red-400">Invalid job id.</div>;
+  if (!data) {
+    return error
+      ? <div className="text-sm text-red-400">{error.message}</div>
+      : <div className="text-sm text-zinc-500">loading…</div>;
+  }
 
   const failedCount = items.filter(i => i.status === 'failed').length;
+  // What the retry route redoes: one per failed delete or failed (destination, document) pair, and only
+  // kinds it accepts, so the button never offers a retry the server refuses.
+  const retryableCount = new Set(
+    items
+      .filter(i => i.status === 'failed' && RETRYABLE_ITEM_KINDS.includes(i.kind))
+      .map(i => (i.kind === 'delete' ? i.id : `${i.destId}:${i.docId}`)),
+  ).size;
   const succeededCount = items.filter(i => i.status === 'succeeded').length;
   const skippedCount = items.filter(i => i.status === 'skipped').length;
 
@@ -70,14 +101,22 @@ export default function JobDetail() {
             {data.parentJobId && ' · retry'}
           </div>
         </div>
-        <div className="ml-auto flex gap-2">
-          {failedCount > 0 && !data.running && (
+        <div className="ml-auto flex items-center gap-2">
+          {retry.error && (
+            <span className="text-xs text-red-400 max-w-xs truncate" title={retry.error.message}>{retry.error.message}</span>
+          )}
+          {failedCount > 0 && retryableCount === 0 && !data.running && (
+            <span className="text-xs text-zinc-500 max-w-xs">
+              Only query-model or verify steps failed; retry does not re-run those. Start a new migration to re-check them.
+            </span>
+          )}
+          {retryableCount > 0 && !data.running && (
             <button
               disabled={retry.isPending}
               onClick={() => retry.mutate()}
               className="bg-amber-500 text-amber-950 rounded px-3 py-1.5 text-sm font-medium disabled:opacity-40"
             >
-              {retry.isPending ? 'starting…' : `Retry ${failedCount} failed`}
+              {retry.isPending ? 'starting…' : `Retry ${retryableCount} failed`}
             </button>
           )}
         </div>

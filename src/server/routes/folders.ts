@@ -2,22 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { getInstance, isUnlocked } from '../storage/vault.js';
 import { OmniClient } from '../omni/client.js';
-import type { Instance, OmniFolder } from '../../shared/types.js';
+import { cachedFolders } from '../omni/folderCache.js';
+import type { OmniFolder } from '../../shared/types.js';
 
-// Omni has no folder name search (only an exact `path` filter), and listing every folder takes one
-// rate-limited request per 100 folders. So the full list is cached per instance and searched here.
-const FOLDER_CACHE_TTL_MS = 10 * 60_000;
 const MAX_FOLDER_RESULTS = 50;
-const folderCache = new Map<string, { at: number; folders: Promise<OmniFolder[]> }>();
-
-function cachedFolders(inst: Instance, refresh: boolean): { at: number; folders: Promise<OmniFolder[]> } {
-  const hit = folderCache.get(inst.id);
-  if (hit && !refresh && Date.now() - hit.at < FOLDER_CACHE_TTL_MS) return hit;
-  const entry = { at: Date.now(), folders: new OmniClient(inst).listFolders() };
-  folderCache.set(inst.id, entry);
-  entry.folders.catch(() => { if (folderCache.get(inst.id) === entry) folderCache.delete(inst.id); });
-  return entry;
-}
 
 // Every word must match the name or path. Exact matches rank first, then prefix matches.
 export function searchFolders(folders: OmniFolder[], q: string): OmniFolder[] {

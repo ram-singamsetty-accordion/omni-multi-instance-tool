@@ -3,16 +3,22 @@ import type { OmniDocState, OmniDraftPatch } from '../omni/types.js';
 // Builds the v2 draft PATCH body that updates a destination dashboard in place from the source's
 // state (both read with GET /api/v2/documents/{id}).
 
-// Omni rejects a draft PATCH carrying more than 48 non-null query presentations.
+// Omni rejects a draft PATCH carrying more than 48 non-null query presentations. The cap applies to
+// every tab sent, which includes unchanged tabs re-sent verbatim to carry a changed order.
 const MAX_TABS_PER_PATCH = 48;
 
 // Make the destination mirror the source while sending as little as possible: changed or new tabs
 // and controls, null for ones that exist only at the destination, and order / settings / layout /
 // description only when they differ. Anything omitted is left untouched by Omni.
 // `changedTabs` names the tabs whose content changes (new or edited), for the verify step.
-export function buildUpdatePatch(source: OmniDocState, dest: OmniDocState): { patch: OmniDraftPatch; changedTabs: string[] } {
+// `queryModelTabs` lists the tabs that carry a source query model id, changed or not. A tab can have a
+// model with nothing authored in it, so the runner reads each model's YAML and keeps only tabs with
+// tab-only fields or CTEs: an update can't rebuild those models, so verify re-checks them to catch
+// a model left broken by an earlier import.
+export function buildUpdatePatch(source: OmniDocState, dest: OmniDocState): { patch: OmniDraftPatch; changedTabs: string[]; queryModelTabs: { tab: string; modelId: string }[] } {
   const patch: OmniDraftPatch = { summary: 'migration: update content from source' };
   const changedTabs: string[] = [];
+  const queryModelTabs: { tab: string; modelId: string }[] = [];
   // The destination's own model ids, so the body has the same shape as a GET (which Omni documents
   // as a valid PATCH body). Omni rejects ids that don't match the document, so the source's must
   // never be sent.
@@ -28,12 +34,17 @@ export function buildUpdatePatch(source: OmniDocState, dest: OmniDocState): { pa
   for (const [k, v] of Object.entries(srcTabs)) {
     if (v === null || typeof v !== 'object') continue;
     // Cloned: the source state is cached and shared by every destination in the job.
-    const { model_extension_id: _ignored, ...tab } = structuredClone(v) as Record<string, unknown>;
+    const { model_extension_id: srcModelId, ...tab } = structuredClone(v) as Record<string, unknown>;
+    // Recorded before the unchanged check below: the comparison ignores the query model, so a tile
+    // whose only defect is a missing or empty model at the destination looks unchanged.
+    const nestedModelId = (tab.query as Record<string, unknown> | null | undefined)?.model_extension_id;
+    const modelId = typeof srcModelId === 'string' ? srcModelId : typeof nestedModelId === 'string' ? nestedModelId : null;
+    if (modelId) queryModelTabs.push({ tab: String(tab.name ?? ''), modelId });
     const destTab = destTabs[k] ?? null;
     fillTableWrap(tab, destTab);
     if (destTab && canonical(tab) === canonical(omitKey(destTab, 'model_extension_id'))) {
-      // Unchanged. Omni rejects an order naming tabs the patch doesn't carry, so when the order is
-      // sent, resend unchanged tabs verbatim (Omni treats a verbatim tab as a no-op).
+      // Unchanged. Assumed (unconfirmed): Omni rejects an order naming tabs the patch doesn't carry,
+      // so when the order is sent, resend unchanged tabs verbatim (assumed a no-op that keeps their ids).
       if (sendTabOrder) tabData[k] = tab;
       continue;
     }
@@ -49,7 +60,10 @@ export function buildUpdatePatch(source: OmniDocState, dest: OmniDocState): { pa
   }
   const tabCount = Object.keys(tabData).length;
   if (tabCount > MAX_TABS_PER_PATCH) {
-    throw new Error(`update needs to send ${tabCount} tabs; Omni accepts at most ${MAX_TABS_PER_PATCH} per draft patch, so it can't be updated in place yet`);
+    const resent = tabCount - changedTabs.length;
+    throw new Error(`update must send ${tabCount} tabs (${changedTabs.length} changed or new` +
+      (resent ? `, plus ${resent} unchanged re-sent because the tab order changed` : '') +
+      `); Omni accepts at most ${MAX_TABS_PER_PATCH} per draft patch, so it can't be updated in place yet`);
   }
   for (const k of Object.keys(destTabs)) {
     if (!(k in srcTabs)) tabData[k] = null;
@@ -79,7 +93,7 @@ export function buildUpdatePatch(source: OmniDocState, dest: OmniDocState): { pa
   if (Array.isArray(source.containers) && source.containers.length > 0 && canonical(source.containers) !== canonical(dest.containers)) {
     patch.containers = source.containers;
   }
-  return { patch, changedTabs };
+  return { patch, changedTabs, queryModelTabs };
 }
 
 // True when the patch would change something (beyond the summary and the model ids).

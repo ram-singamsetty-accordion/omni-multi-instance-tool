@@ -1,5 +1,6 @@
-import { memo, useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   BarChart as ReBarChart,
@@ -12,35 +13,55 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { api } from '../lib/api';
+import { DASHBOARD_LS } from '../lib/dashboardCache';
 import type { InstancePublic } from '../../shared/types';
 import type { ConnectionStat, EmbedUserStat, InstanceDashboardStats, InstanceEmbedUserStats } from '../lib/api';
 
 // --- localStorage helpers ---
 
 const lsKey = {
-  excluded: (id: string) => `dashboard:excluded:${id}`,
-  connectionsCache: 'dashboard:cache:connections',
-  usersCache: 'dashboard:cache:users',
+  excluded: DASHBOARD_LS.excluded,
+  connectionsCache: DASHBOARD_LS.connections,
+  usersCache: DASHBOARD_LS.users,
 };
+
+// An empty snapshot, or one holding only per-instance error rows (Omni was unreachable), is never seeded:
+// with staleTime Infinity it would stand in for a fetch forever.
+const hasUsableRow = (data: unknown): boolean =>
+  Array.isArray(data) && data.some(r => !(r as { error?: unknown }).error);
 
 function lsGetCache<T>(key: string): { data: T; fetchedAt: number } | null {
   try {
     const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as { data: T; fetchedAt: number }) : null;
+    const parsed = raw ? (JSON.parse(raw) as { data: T; fetchedAt: number }) : null;
+    return parsed && hasUsableRow(parsed.data) ? parsed : null;
   } catch {
     return null;
   }
 }
 
 function lsSetCache<T>(key: string, data: T, fetchedAt: number): void {
-  localStorage.setItem(key, JSON.stringify({ data, fetchedAt }));
+  try {
+    if (Array.isArray(data) && !hasUsableRow(data)) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify({ data, fetchedAt }));
+  } catch {
+    /* quota or storage blocked: skip caching */
+  }
+}
+
+function formatAgo(ms: number): string {
+  const secs = Math.max(0, Math.floor(ms / 1000)); // a future timestamp (clock moved back) reads as 0s
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 function formatElapsed(timestampMs: number): string {
   if (!timestampMs) return 'never fetched';
-  const secs = Math.floor((Date.now() - timestampMs) / 1000);
-  if (secs < 60) return `${secs}s ago`;
-  return `${Math.floor(secs / 60)}m ago`;
+  return formatAgo(Date.now() - timestampMs);
 }
 
 function ElapsedLabel({ timestampMs }: { timestampMs: number }) {
@@ -62,15 +83,33 @@ function lsGetExcluded(instanceId: string): Set<string> {
 }
 
 function lsSetExcluded(instanceId: string, excluded: Set<string>): void {
-  localStorage.setItem(lsKey.excluded(instanceId), JSON.stringify([...excluded]));
+  try {
+    localStorage.setItem(lsKey.excluded(instanceId), JSON.stringify([...excluded]));
+  } catch {
+    /* quota or storage blocked: the exclusion lasts for this session only */
+  }
+}
+
+// An instance seeded outside the API can hold an unparseable base URL; a throw here would blank the whole app.
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url || '(no url)';
+  }
 }
 
 // --- Date range helpers ---
 
+// <input type="date"> yields 'YYYY-MM-DD'; new Date(that) is UTC midnight, so build local-time bounds instead.
+function startOfDay(dateStr: string): Date {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y!, m! - 1, d!, 0, 0, 0, 0);
+}
+
 function endOfDay(dateStr: string): Date {
-  const d = new Date(dateStr);
-  d.setHours(23, 59, 59, 999);
-  return d;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y!, m! - 1, d!, 23, 59, 59, 999);
 }
 
 function DateRangePicker({
@@ -103,6 +142,55 @@ function DateRangePicker({
           clear
         </button>
       )}
+      {from && to && from > to && <span className="text-amber-500/70">start is after end</span>}
+    </div>
+  );
+}
+
+// --- Query helpers ---
+
+// Both routes answer 200 with a per-instance `error` row when one instance fails. Keep that instance's last good
+// row (flagged with refreshError) so a transient failure does not wipe it from memory and from the localStorage cache.
+function withLastGood<T extends { instanceId: string; error?: string; refreshError?: string }>(fresh: T[], prev: T[] | undefined): T[] {
+  return fresh.map(f => {
+    if (!f.error) return f;
+    const old = prev?.find(p => p.instanceId === f.instanceId && !p.error);
+    return old ? { ...old, refreshError: f.error } : f;
+  });
+}
+
+// Shared by the Connections tab and the Users tab (same ['dashboard-stats'] key).
+const fetchStats = (qc: QueryClient) => async () =>
+  withLastGood(await api.getDashboardStats(), qc.getQueryData<InstanceDashboardStats[]>(['dashboard-stats']));
+
+const fetchEmbedUsers = (qc: QueryClient) => async () =>
+  withLastGood(await api.getEmbedUserStats(), qc.getQueryData<InstanceEmbedUserStats[]>(['dashboard-embed-users']));
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'unknown error';
+}
+
+// A failed refetch keeps `data`, so show the failure above the stale data instead of replacing the tab.
+function RefreshErrorBanner({ error, updatedAt }: { error: unknown; updatedAt: number }) {
+  return (
+    <div className="text-red-400 text-xs">
+      Refresh failed: {errorMessage(error)}
+      {updatedAt > 0 && ` (showing data from ${formatElapsed(updatedAt)})`}
+    </div>
+  );
+}
+
+function LoadErrorWithRetry({ what, error, onRetry, retrying }: { what: string; error: unknown; onRetry: () => void; retrying: boolean }) {
+  return (
+    <div className="flex items-center gap-3 text-sm text-red-400">
+      <span>Failed to load {what}: {errorMessage(error)}</span>
+      <button
+        className="text-xs text-zinc-300 hover:text-zinc-100 underline disabled:opacity-40"
+        onClick={onRetry}
+        disabled={retrying}
+      >
+        {retrying ? 'retrying…' : 'Retry'}
+      </button>
     </div>
   );
 }
@@ -144,11 +232,12 @@ function TabButton({ label, active, onClick }: { label: string; active: boolean;
 // --- Connections Tab ---
 
 function ConnectionsTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
-  const cached = lsGetCache<InstanceDashboardStats[]>(lsKey.connectionsCache);
+  const qc = useQueryClient();
+  const [cached] = useState(() => lsGetCache<InstanceDashboardStats[]>(lsKey.connectionsCache));
   const { data: instances } = useQuery<InstancePublic[]>({ queryKey: ['instances'], queryFn: api.listInstances, staleTime: Infinity });
   const { data: allData, isLoading, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['dashboard-stats'],
-    queryFn: api.getDashboardStats,
+    queryFn: fetchStats(qc),
     staleTime: Infinity,
     initialData: cached?.data,
     initialDataUpdatedAt: cached?.fetchedAt,
@@ -193,12 +282,8 @@ function ConnectionsTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
 
   if (isLoading) return <div className="text-zinc-400 text-sm">Loading…</div>;
 
-  if (error) {
-    return (
-      <div className="text-red-400 text-sm">
-        Failed to load stats: {error instanceof Error ? error.message : 'unknown error'}
-      </div>
-    );
+  if (error && (!data || data.length === 0)) {
+    return <LoadErrorWithRetry what="stats" error={error} onRetry={() => void refetch()} retrying={isFetching} />;
   }
 
   if (!data || data.length === 0) {
@@ -211,6 +296,13 @@ function ConnectionsTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
             ? 'No instances are enabled for the Connections tab. Configure them from the Instances tab.'
             : 'No instances configured.'}
         </p>
+        <button
+          className="px-4 py-2 text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded disabled:opacity-40"
+          onClick={() => void refetch()}
+          disabled={isFetching}
+        >
+          {isFetching ? 'Refreshing…' : 'Refresh'}
+        </button>
         <button
           className="px-4 py-2 text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded"
           onClick={() => nav('/instances')}
@@ -246,6 +338,8 @@ function ConnectionsTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
           <ElapsedLabel timestampMs={dataUpdatedAt} />
         </div>
       </div>
+
+      {error && <RefreshErrorBanner error={error} updatedAt={dataUpdatedAt} />}
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
         <StatCard label="Instances" value={data.length} />
@@ -291,14 +385,25 @@ function ConnectionsTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
 // --- Users Tab ---
 
 const ALL_EMBED_USERS_GROUP = 'All Embed Users';
+const NO_GROUP = '(No Group)';
+
+// Real entities only: the synthetic NO_GROUP bucket is not an entity.
+const entityKeysOf = (users: EmbedUserStat[], sep?: string) =>
+  Object.keys(groupUsersByGroup(users, sep)).filter(k => k !== NO_GROUP);
 
 function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
-  const cached = lsGetCache<InstanceEmbedUserStats[]>(lsKey.usersCache);
+  const qc = useQueryClient();
+  const [cached] = useState(() => lsGetCache<InstanceEmbedUserStats[]>(lsKey.usersCache));
   const { data: instances } = useQuery<InstancePublic[]>({ queryKey: ['instances'], queryFn: api.listInstances, staleTime: Infinity });
-  const { data: connectionsData } = useQuery({ queryKey: ['dashboard-stats'], queryFn: api.getDashboardStats, staleTime: Infinity });
+  const {
+    data: connectionsData,
+    refetch: refetchConnections,
+    isFetching: connFetching,
+    dataUpdatedAt: connUpdatedAt,
+  } = useQuery({ queryKey: ['dashboard-stats'], queryFn: fetchStats(qc), staleTime: Infinity });
   const { data: allData, isLoading, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['dashboard-embed-users'],
-    queryFn: api.getEmbedUserStats,
+    queryFn: fetchEmbedUsers(qc),
     staleTime: Infinity,
     initialData: cached?.data,
     initialDataUpdatedAt: cached?.fetchedAt,
@@ -311,32 +416,60 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
   const [dateTo, setDateTo] = useState('');
   const [drawer, setDrawer] = useState<DrawerData | null>(null);
   const [appDisabled, setAppDisabled] = useState<Set<string>>(new Set());
+  const [appDisabledError, setAppDisabledError] = useState<string | null>(null);
+  // Saves are chained so POSTs reach the server in click order (each one carries the whole list).
+  const saveChain = useRef<Promise<unknown>>(Promise.resolve());
+  // Bumped on every toggle so a slower GET (initial load or post-failure resync) never overwrites a newer local change.
+  const appDisabledEdits = useRef(0);
+
+  const resyncAppDisabled = () => {
+    const seen = appDisabledEdits.current;
+    return api.getAppDisabled()
+      .then(r => { if (appDisabledEdits.current === seen) setAppDisabled(new Set(r.keys)); })
+      .catch(() => {});
+  };
 
   useEffect(() => {
-    api.getAppDisabled().then(r => setAppDisabled(new Set(r.keys))).catch(() => {});
+    void resyncAppDisabled();
   }, []);
 
   const toggleAppDisabled = (key: string) => {
-    setAppDisabled(prev => {
-      const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
-      api.setAppDisabled([...next]).catch(() => {});
-      return next;
-    });
+    const next = new Set(appDisabled);
+    next.has(key) ? next.delete(key) : next.add(key);
+    appDisabledEdits.current++;
+    setAppDisabled(next);
+    setAppDisabledError(null);
+    const keys = [...next];
+    saveChain.current = saveChain.current
+      .then(() => api.setAppDisabled(keys))
+      .then(() => {}, (err: unknown) => {
+        setAppDisabledError(`Could not save 'App off' change: ${err instanceof Error ? err.message : String(err)}`);
+        void resyncAppDisabled(); // show what the server actually has, not an unsaved snapshot
+      });
   };
 
   useEffect(() => {
     if (allData) lsSetCache(lsKey.usersCache, allData, dataUpdatedAt);
   }, [allData, dataUpdatedAt]);
 
+  // The connections tab is unmounted here, so persist a refreshed snapshot for its next localStorage seed.
+  useEffect(() => {
+    if (connectionsData) lsSetCache(lsKey.connectionsCache, connectionsData, connUpdatedAt);
+  }, [connectionsData, connUpdatedAt]);
+
   const data = useMemo(() => {
-    if (!allData || !dateTo) return allData;
-    const end = endOfDay(dateTo);
-    return allData.map(inst => ({
-      ...inst,
-      users: inst.users.filter(u => !u.createdAt || new Date(u.createdAt) <= end),
-    }));
-  }, [allData, dateTo]);
+    const from = dateFrom ? startOfDay(dateFrom).getTime() : null;
+    const to = dateTo ? endOfDay(dateTo).getTime() : null;
+    if (!allData || (from === null && to === null)) return allData;
+    return allData.map(inst => {
+      const users = inst.users.filter(u => {
+        if (!u.createdAt) return true;
+        const t = new Date(u.createdAt).getTime();
+        return (from === null || t >= from) && (to === null || t <= to);
+      });
+      return { ...inst, users, filteredCount: users.filter(u => u.filtered).length };
+    });
+  }, [allData, dateFrom, dateTo]);
 
   const toggleExpand = (id: string) =>
     setExpanded(prev => {
@@ -347,12 +480,8 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
 
   if (isLoading) return <div className="text-zinc-400 text-sm">Loading…</div>;
 
-  if (error) {
-    return (
-      <div className="text-red-400 text-sm">
-        Failed to load users: {error instanceof Error ? error.message : 'unknown error'}
-      </div>
-    );
+  if (error && (!data || data.length === 0)) {
+    return <LoadErrorWithRetry what="users" error={error} onRetry={() => void refetch()} retrying={isFetching} />;
   }
 
   if (!data || data.length === 0) {
@@ -365,6 +494,13 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
             ? 'No instances are enabled for the Users tab. Configure them from the Instances tab.'
             : 'No instances configured.'}
         </p>
+        <button
+          className="px-4 py-2 text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded disabled:opacity-40"
+          onClick={() => { void refetch(); void refetchConnections(); }}
+          disabled={isFetching || connFetching}
+        >
+          {isFetching || connFetching ? 'Refreshing…' : 'Refresh'}
+        </button>
         <button
           className="px-4 py-2 text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded"
           onClick={() => nav('/instances')}
@@ -379,12 +515,21 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
   const totalFilteredUsers = data.reduce((sum, i) => sum + (i.filteredCount ?? 0), 0);
 
   const separatorMap = new Map(instances?.map(i => [i.id, i.entityGroupSeparator]) ?? []);
-  const connectionsMap = new Map(connectionsData?.map(c => [c.instanceId, c.connections]) ?? []);
+  // Dead entities need both lists, so only instances whose users and connections both loaded get an entry here.
+  const connectionStats = new Map(connectionsData?.map(c => [c.instanceId, c]) ?? []);
+  const connectionsMap = new Map<string, ConnectionStat[]>();
+  for (const inst of data) {
+    const stat = connectionStats.get(inst.instanceId);
+    if (!inst.error && stat && !stat.error) connectionsMap.set(inst.instanceId, stat.connections);
+  }
+  // An instance with its Connections tab turned off is not an unknown: it was never asked for connections.
+  const connectionsOff = (instanceId: string) => instances?.find(i => i.id === instanceId)?.dashboardTabs?.includes('connections') === false;
+  const unknownInstances = data.filter(i => !connectionsMap.has(i.instanceId) && !connectionsOff(i.instanceId)).length;
   const { totalEntities, totalFilteredEntities, totalEntitiesNoUsers, totalFilteredEntitiesNoUsers } = data.reduce(
     (acc, inst) => {
       const sep = separatorMap.get(inst.instanceId);
-      const activeKeys = new Set(Object.keys(groupUsersByGroup(inst.users.filter(u => !u.filtered), sep)));
-      const filteredKeys = new Set(Object.keys(groupUsersByGroup(inst.users.filter(u => u.filtered), sep)));
+      const activeKeys = new Set(entityKeysOf(inst.users.filter(u => !u.filtered), sep));
+      const filteredKeys = new Set(entityKeysOf(inst.users.filter(u => u.filtered), sep));
       const filteredOnly = [...filteredKeys].filter(k => !activeKeys.has(k)).length;
       const connections = connectionsMap.get(inst.instanceId) ?? [];
       const allEntityKeys = new Set(Object.keys(groupUsersByGroup(inst.users, sep)).map(k => k.toLowerCase()));
@@ -399,6 +544,8 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
     },
     { totalEntities: 0, totalFilteredEntities: 0, totalEntitiesNoUsers: 0, totalFilteredEntitiesNoUsers: 0 }
   );
+  const noUsersValue = unknownInstances === 0 ? totalEntitiesNoUsers : connectionsMap.size === 0 ? '—' : `${totalEntitiesNoUsers}+`;
+  const noUsersTitle = unknownInstances > 0 ? `Connection or user stats unavailable for ${unknownInstances} instance(s)` : undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -407,14 +554,19 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
         <div className="flex items-center gap-2">
           <button
             className="text-xs text-zinc-400 hover:text-zinc-200 disabled:opacity-40"
-            onClick={() => refetch()}
-            disabled={isFetching}
+            onClick={() => { void refetch(); void refetchConnections(); }}
+            disabled={isFetching || connFetching}
           >
-            {isFetching ? 'refreshing…' : 'refresh'}
+            {isFetching || connFetching ? 'refreshing…' : 'refresh'}
           </button>
+          <span className="text-xs text-zinc-600">users</span>
           <ElapsedLabel timestampMs={dataUpdatedAt} />
+          <span className="text-xs text-zinc-600">connections</span>
+          <ElapsedLabel timestampMs={connUpdatedAt} />
         </div>
       </div>
+
+      {error && <RefreshErrorBanner error={error} updatedAt={dataUpdatedAt} />}
 
       <DateRangePicker
         from={dateFrom}
@@ -443,18 +595,18 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
           rows: data.flatMap(inst => {
             const sep = separatorMap.get(inst.instanceId);
             const instName = instances?.find(x => x.id === inst.instanceId)?.label;
-            const activeKeys = new Set(Object.keys(groupUsersByGroup(inst.users.filter(u => !u.filtered), sep)));
+            const activeKeys = new Set(entityKeysOf(inst.users.filter(u => !u.filtered), sep));
             return [...activeKeys].sort().map(e => ({ primary: e, secondary: instName }));
           }),
           filteredRows: data.flatMap(inst => {
             const sep = separatorMap.get(inst.instanceId);
             const instName = instances?.find(x => x.id === inst.instanceId)?.label;
-            const activeKeys = new Set(Object.keys(groupUsersByGroup(inst.users.filter(u => !u.filtered), sep)));
-            const filteredKeys = Object.keys(groupUsersByGroup(inst.users.filter(u => u.filtered), sep));
+            const activeKeys = new Set(entityKeysOf(inst.users.filter(u => !u.filtered), sep));
+            const filteredKeys = entityKeysOf(inst.users.filter(u => u.filtered), sep);
             return filteredKeys.filter(k => !activeKeys.has(k)).sort().map(e => ({ primary: e, secondary: instName }));
           }),
         })} />
-        <StatCard label="Entities with No Users" value={totalEntitiesNoUsers} highlight={totalEntitiesNoUsers > 0} filtered={totalFilteredEntitiesNoUsers || undefined} onClick={() => setDrawer({
+        <StatCard label="Entities with No Users" value={noUsersValue} title={noUsersTitle} highlight={totalEntitiesNoUsers > 0} filtered={totalFilteredEntitiesNoUsers || undefined} onClick={() => setDrawer({
           title: 'Entities with No Users',
           showAppDisabledCheckbox: true,
           rows: data.flatMap(inst => {
@@ -474,7 +626,8 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
         })} />
       </div>
 
-      {drawer && <KpiDrawer drawer={drawer} onClose={() => setDrawer(null)} appDisabled={appDisabled} onToggleAppDisabled={toggleAppDisabled} />}
+      {drawer && <KpiDrawer drawer={drawer} onClose={() => setDrawer(null)} appDisabled={appDisabled} onToggleAppDisabled={toggleAppDisabled} error={appDisabledError} />}
+      {!drawer && appDisabledError && <div className="text-xs text-red-400">{appDisabledError}</div>}
 
       <UserUsageChart data={data} />
 
@@ -496,6 +649,7 @@ function UsersTab({ nav }: { nav: ReturnType<typeof useNavigate> }) {
               inst={inst}
               entityGroupSeparator={separatorMap.get(inst.instanceId)}
               connections={connectionsMap.get(inst.instanceId)}
+              connectionsOff={connectionsOff(inst.instanceId)}
               isExpanded={expanded.has(inst.instanceId)}
               onToggleExpand={() => toggleExpand(inst.instanceId)}
               search={search[inst.instanceId] ?? ''}
@@ -544,6 +698,7 @@ function UserInstanceCard({
   inst,
   entityGroupSeparator,
   connections,
+  connectionsOff,
   isExpanded,
   onToggleExpand,
   search,
@@ -552,6 +707,7 @@ function UserInstanceCard({
   inst: InstanceEmbedUserStats;
   entityGroupSeparator?: string;
   connections?: ConnectionStat[];
+  connectionsOff?: boolean;
   isExpanded: boolean;
   onToggleExpand: () => void;
   search: string;
@@ -572,8 +728,8 @@ function UserInstanceCard({
 
   const groups = groupUsersByGroup(inst.users, entityGroupSeparator);
   const groupNames = Object.keys(groups).sort();
-  const activeEntityCount = Object.keys(groupUsersByGroup(inst.users.filter(u => !u.filtered), entityGroupSeparator)).length;
-  const filteredEntityKeys = new Set(Object.keys(groupUsersByGroup(inst.users.filter(u => u.filtered), entityGroupSeparator)));
+  const activeEntityCount = entityKeysOf(inst.users.filter(u => !u.filtered), entityGroupSeparator).length;
+  const filteredEntityKeys = new Set(entityKeysOf(inst.users.filter(u => u.filtered), entityGroupSeparator));
   const filteredOnlyEntityCount = [...filteredEntityKeys].filter(k => !groups[k] || groups[k]!.every(u => u.filtered)).length;
   const q = search.trim().toLowerCase();
 
@@ -616,9 +772,9 @@ function UserInstanceCard({
       const allFiltered = all.every(u => u.filtered);
       const loggedIn = all.filter(u => u.lastLogin !== null).length;
       const neverLogged = all.filter(u => u.lastLogin === null).length;
-      return { name, total: all.length, loggedIn, neverLogged, allFiltered, dead: false };
+      return { key: `g:${name}`, name, total: all.length, loggedIn, neverLogged, allFiltered, dead: false };
     }),
-    ...deadConnections.map(c => ({ name: c.name, total: 0, loggedIn: 0, neverLogged: 0, allFiltered: false, dead: true })),
+    ...deadConnections.map(c => ({ key: `dead:${c.id}`, name: c.name, total: 0, loggedIn: 0, neverLogged: 0, allFiltered: false, dead: true })),
   ]
     .filter(e => q ? e.name.toLowerCase().includes(q) : true)
     .sort((a, b) => b.total - a.total);
@@ -641,6 +797,9 @@ function UserInstanceCard({
             <span className="text-red-400">error</span>
           ) : (
             <>
+              {inst.refreshError && (
+                <span className="text-amber-400 whitespace-nowrap" title={inst.refreshError}>stale - refresh failed</span>
+              )}
               <span className="text-zinc-400 whitespace-nowrap">
                 <span className="text-zinc-200 font-medium">{inst.users.length - (inst.filteredCount ?? 0)}</span>
                 {(inst.filteredCount ?? 0) > 0 && (
@@ -652,12 +811,14 @@ function UserInstanceCard({
                 {activeEntityCount} {activeEntityCount !== 1 ? 'entities' : 'entity'}
                 {filteredOnlyEntityCount > 0 && <span className="text-zinc-700"> ({filteredOnlyEntityCount} filtered)</span>}
               </span>
-              {deadConnections.length > 0 && (
+              {connections === undefined ? (
+                !connectionsOff && <span className="text-zinc-600 whitespace-nowrap">connections unavailable</span>
+              ) : deadConnections.length > 0 && (
                 <span className="text-amber-500/70 whitespace-nowrap">{deadConnections.length} with no users</span>
               )}
             </>
           )}
-          <span className="text-zinc-600">{new URL(inst.baseUrl).hostname}</span>
+          <span className="text-zinc-600">{hostOf(inst.baseUrl)}</span>
         </div>
       </button>
 
@@ -705,7 +866,7 @@ function UserInstanceCard({
                     {entityRows.map(e => {
                       const dim = e.dead ? 'opacity-35' : e.allFiltered ? 'opacity-40 italic' : '';
                       return (
-                        <tr key={e.name} className={`border-b border-zinc-800/50 last:border-0 ${dim}`}>
+                        <tr key={e.key} className={`border-b border-zinc-800/50 last:border-0 ${dim}`}>
                           <td className="py-1.5 pr-4 text-zinc-300">{e.name}</td>
                           <td className="py-1.5 pr-4 text-right">
                             {e.dead
@@ -766,14 +927,15 @@ function UserInstanceCard({
 }
 
 function groupUsersByGroup(users: EmbedUserStat[], separator?: string): Record<string, EmbedUserStat[]> {
-  const out: Record<string, EmbedUserStat[]> = {};
-  const seen: Record<string, Set<string>> = {};
+  // Keys are untrusted Omni group names ('constructor', '__proto__', ...), so no inherited properties.
+  const out: Record<string, EmbedUserStat[]> = Object.create(null);
+  const seen: Record<string, Set<string>> = Object.create(null);
   const toKey = (display: string) =>
     separator ? display.split(separator)[0]!.trim() : display;
   for (const u of users) {
     const relevantGroups = u.groups.filter(g => g.display !== ALL_EMBED_USERS_GROUP);
     if (relevantGroups.length === 0) {
-      const key = '(No Group)';
+      const key = NO_GROUP;
       (out[key] ??= []).push(u);
     } else {
       for (const g of relevantGroups) {
@@ -813,6 +975,8 @@ function GlobalConnectionResults({
       )
       .map(c => ({ ...c, instanceId: inst.instanceId, instanceLabel: inst.instanceLabel }))
   );
+
+  if (rows.length === 0) return <p className="text-xs text-zinc-500">No connections match.</p>;
 
   return (
     <table className="w-full text-xs border-collapse">
@@ -872,7 +1036,7 @@ function GlobalUserResults({
         u.embedExternalId.toLowerCase().includes(q) ||
         u.userName.toLowerCase().includes(q)
       )
-      .map(u => ({ ...u, instanceLabel: inst.instanceLabel }))
+      .map(u => ({ ...u, instanceId: inst.instanceId, instanceLabel: inst.instanceLabel }))
   );
 
   if (rows.length === 0) return <p className="text-xs text-zinc-500">No users match.</p>;
@@ -890,7 +1054,11 @@ function GlobalUserResults({
       </thead>
       <tbody>
         {rows.map(u => (
-          <tr key={`${u.instanceLabel}:${u.id}`} className="border-b border-zinc-800/50 last:border-0">
+          <tr
+            key={`${u.instanceId}:${u.id}`}
+            className={`border-b border-zinc-800/50 last:border-0 transition-opacity ${u.filtered ? 'opacity-50 italic' : ''}`}
+            title={u.filtered ? "Filtered out by this instance's dashboard filter" : undefined}
+          >
             <td className="py-1.5 pr-4 text-zinc-500">{u.instanceLabel}</td>
             <td className="py-1.5 pr-4 text-zinc-300">{u.displayName}</td>
             <td className="py-1.5 pr-4 text-zinc-400 font-mono">{u.embedExternalId || '—'}</td>
@@ -911,14 +1079,13 @@ function GlobalUserResults({
 
 function computeWeeklyLogins(users: EmbedUserStat[]): { label: string; count: number }[] {
   const now = new Date();
-  const msDay = 86_400_000;
-  const msWeek = 7 * msDay;
-  // Align to Monday of current week
   const dayOfWeek = (now.getDay() + 6) % 7; // Mon=0 ... Sun=6
-  const currentMonday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - dayOfWeek);
+  // Local-midnight Monday `weeksAgo` weeks back; calendar days, not milliseconds, so DST can't shift the boundary.
+  const mondayWeeksAgo = (weeksAgo: number) =>
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() - dayOfWeek - 7 * weeksAgo);
   return Array.from({ length: 12 }, (_, i) => {
-    const start = new Date(currentMonday.getTime() - (11 - i) * msWeek);
-    const end = new Date(start.getTime() + msWeek);
+    const start = mondayWeeksAgo(11 - i);
+    const end = mondayWeeksAgo(10 - i); // i = 11 -> next Monday
     return {
       label: `${start.getMonth() + 1}/${start.getDate()}`,
       count: users.filter(u => {
@@ -951,7 +1118,7 @@ function computeMonthlySignups(users: EmbedUserStat[]): { label: string; count: 
   });
 }
 
-function UsageBarChart({ data, color }: { data: { label: string; count: number }[]; color: string }) {
+function UsageBarChart({ data, color, labelPrefix }: { data: { label: string; count: number }[]; color: string; labelPrefix?: string }) {
   return (
     <ResponsiveContainer width="100%" height={140}>
       <ReBarChart data={data} margin={{ top: 20, right: 4, bottom: 0, left: 4 }} barCategoryGap="30%">
@@ -969,6 +1136,7 @@ function UsageBarChart({ data, color }: { data: { label: string; count: number }
           contentStyle={{ background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, fontSize: 12, color: '#e4e4e7' }}
           itemStyle={{ color: '#e4e4e7' }}
           labelStyle={{ color: '#a1a1aa', marginBottom: 2 }}
+          labelFormatter={labelPrefix ? (l: React.ReactNode) => `${labelPrefix} ${l}` : undefined}
         />
         <Bar dataKey="count" fill={color} radius={[3, 3, 0, 0]} name="Users">
           <LabelList dataKey="count" position="top" style={{ fill: '#a1a1aa', fontSize: 11 }} formatter={(v: unknown) => (v as number) === 0 ? '' : (v as number)} />
@@ -990,7 +1158,7 @@ function MiniStat({ label, value, total, warn }: { label: string; value: number;
 }
 
 const UserUsageChart = memo(function UserUsageChart({ data }: { data: InstanceEmbedUserStats[] }) {
-  const allUsers = data.flatMap(d => d.users);
+  const allUsers = data.flatMap(d => d.users.filter(u => !u.filtered));
   const now = Date.now();
   const msDay = 86_400_000;
   const active7 = allUsers.filter(u => u.lastLogin && now - new Date(u.lastLogin).getTime() < 7 * msDay).length;
@@ -1011,8 +1179,8 @@ const UserUsageChart = memo(function UserUsageChart({ data }: { data: InstanceEm
       </div>
       <div className="grid grid-cols-2 gap-6">
         <div>
-          <p className="text-xs text-zinc-600 mb-1">Logins per week — last {weeklyLogins.length} weeks</p>
-          <UsageBarChart data={weeklyLogins} color="#3b82f6" />
+          <p className="text-xs text-zinc-600 mb-1">Users by last-login week — last {weeklyLogins.length} weeks</p>
+          <UsageBarChart data={weeklyLogins} color="#3b82f6" labelPrefix="Week of" />
         </div>
         <div>
           <p className="text-xs text-zinc-600 mb-1">New users per month — last {monthlySignups.length} months</p>
@@ -1097,11 +1265,12 @@ function DrawerSection({ label, rows, dimmed, appDisabled, onToggleAppDisabled }
   );
 }
 
-function KpiDrawer({ drawer, onClose, appDisabled, onToggleAppDisabled }: {
+function KpiDrawer({ drawer, onClose, appDisabled, onToggleAppDisabled, error }: {
   drawer: DrawerData;
   onClose: () => void;
   appDisabled?: Set<string>;
   onToggleAppDisabled?: (key: string) => void;
+  error?: string | null;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
@@ -1111,6 +1280,7 @@ function KpiDrawer({ drawer, onClose, appDisabled, onToggleAppDisabled }: {
           <span className="text-sm font-medium text-zinc-200">{drawer.title}</span>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200 text-lg leading-none">✕</button>
         </div>
+        {error && <div className="px-4 py-2 text-xs text-red-400 border-b border-zinc-800">{error}</div>}
         <div className="overflow-y-auto flex-1">
           <DrawerSection label={`Active (${drawer.rows.length})`} rows={drawer.rows} />
           {!!drawer.filteredRows?.length && (
@@ -1130,9 +1300,10 @@ function KpiDrawer({ drawer, onClose, appDisabled, onToggleAppDisabled }: {
 
 // --- Sub-components ---
 
-function StatCard({ label, value, highlight, filtered, onClick }: { label: string; value: number; highlight?: boolean; filtered?: number; onClick?: () => void }) {
+function StatCard({ label, value, title, highlight, filtered, onClick }: { label: string; value: number | string; title?: string; highlight?: boolean; filtered?: number; onClick?: () => void }) {
   return (
     <div
+      title={title}
       className={`rounded-lg border border-zinc-800 bg-zinc-900 p-4 border-t-2 ${highlight ? 'border-t-amber-500/70' : 'border-t-blue-500/30'} ${onClick ? 'cursor-pointer hover:bg-zinc-800/60 transition-colors' : ''}`}
       onClick={onClick}
     >
@@ -1145,7 +1316,48 @@ function StatCard({ label, value, highlight, filtered, onClick }: { label: strin
   );
 }
 
-type RefreshStatus = 'idle' | 'pending' | 'ok' | 'error';
+// Schema refresh state lives outside InstanceCard so it survives the card unmounting (global search, tab switch).
+// Keyed by `${instanceId}:${connectionId}`: a bare connection id is not guaranteed unique across instances.
+// 'queued' waits for a Refresh All worker, 'pending' is in flight, 'ok' means Omni accepted the job (it runs async).
+type RefreshStatus = 'idle' | 'queued' | 'pending' | 'ok' | 'error';
+type RefreshState = { status: RefreshStatus; error?: string };
+
+const refreshStates = new Map<string, RefreshState>();
+const refreshListeners = new Set<() => void>();
+let refreshSnapshot: ReadonlyMap<string, RefreshState> = new Map();
+
+function setRefreshState(key: string, st: RefreshState | null): void {
+  if (st) refreshStates.set(key, st);
+  else refreshStates.delete(key);
+  refreshSnapshot = new Map(refreshStates);
+  refreshListeners.forEach(l => l());
+}
+
+function subscribeRefreshStates(cb: () => void): () => void {
+  refreshListeners.add(cb);
+  return () => {
+    refreshListeners.delete(cb);
+  };
+}
+
+function useRefreshStates(): ReadonlyMap<string, RefreshState> {
+  return useSyncExternalStore(subscribeRefreshStates, () => refreshSnapshot);
+}
+
+// The stats are never refetched on their own (staleTime Infinity), so re-sync after a queued refresh: once while Omni is
+// likely done, once later, then drop the 'ok' marks so rows that did not flip to "has schema" can be retried.
+// One debounced set of timers, not one per success. Not cleared on unmount: qc is global and a late invalidate is harmless.
+let resyncTimers: ReturnType<typeof setTimeout>[] = [];
+function scheduleResync(qc: QueryClient): void {
+  resyncTimers.forEach(t => clearTimeout(t));
+  resyncTimers = [20_000, 90_000].map((ms, i, all) => setTimeout(async () => {
+    // Snapshot before the (slow) refetch: a refresh queued while it runs belongs to the next resync, not this one.
+    const stale = i === all.length - 1 ? [...refreshStates].filter(([, v]) => v.status === 'ok').map(([k]) => k) : [];
+    await qc.invalidateQueries({ queryKey: ['dashboard-stats'] });
+    for (const k of stale) if (refreshStates.get(k)?.status === 'ok') setRefreshState(k, null);
+  }, ms));
+}
+
 function InstanceCard({
   inst,
   isExpanded,
@@ -1163,8 +1375,17 @@ function InstanceCard({
   excludedIds: Set<string>;
   onToggleExclude: (id: string) => void;
 }) {
-  const [refreshStatus, setRefreshStatus] = useState<Record<string, RefreshStatus>>({});
-  const [refreshError, setRefreshError] = useState<Record<string, string>>({});
+  const states = useRefreshStates();
+  const qc = useQueryClient();
+  const keyOf = (c: ConnectionStat) => `${inst.instanceId}:${c.id}`;
+  const refreshStatus: Record<string, RefreshStatus> = {};
+  const refreshError: Record<string, string> = {};
+  for (const c of inst.connections) {
+    const st = states.get(keyOf(c));
+    if (!st) continue;
+    refreshStatus[c.id] = st.status;
+    if (st.error) refreshError[c.id] = st.error;
+  }
 
   const activeConnections = inst.connections.filter(c => !excludedIds.has(c.id) && !c.filtered);
   const missing = activeConnections.filter(c => !c.hasSchemaModel);
@@ -1174,25 +1395,41 @@ function InstanceCard({
 
   const refreshOne = async (c: ConnectionStat) => {
     if (!c.schemaModelId) return;
-    setRefreshStatus(prev => ({ ...prev, [c.id]: 'pending' }));
-    setRefreshError(prev => { const n = { ...prev }; delete n[c.id]; return n; });
+    const key = keyOf(c);
+    if (refreshStates.get(key)?.status === 'pending') return;
+    setRefreshState(key, { status: 'pending' });
     try {
-      await api.refreshSchema(inst.instanceId, c.schemaModelId);
-      setRefreshStatus(prev => ({ ...prev, [c.id]: 'ok' }));
+      const r = await api.refreshSchema(inst.instanceId, c.schemaModelId);
+      if (r.status?.toLowerCase() === 'failed') throw new Error(`Omni reported the schema refresh as failed (job ${r.jobId})`);
+      setRefreshState(key, { status: 'ok' });
+      scheduleResync(qc);
     } catch (err) {
-      setRefreshStatus(prev => ({ ...prev, [c.id]: 'error' }));
-      setRefreshError(prev => ({ ...prev, [c.id]: err instanceof Error ? err.message : 'failed' }));
+      setRefreshState(key, { status: 'error', error: err instanceof Error ? err.message : 'failed' });
     }
   };
 
-
-  const refreshAll = () => {
-    const targets = activeConnections.filter(c => c.schemaModelId && !c.hasSchemaModel);
-    for (const c of targets) refreshOne(c);
+  // Queued, in flight and already-queued rows are not refreshable again, so a second click cannot double-queue them.
+  const isRefreshable = (c: ConnectionStat) => {
+    const s = refreshStatus[c.id];
+    return !!c.schemaModelId && !c.hasSchemaModel && s !== 'queued' && s !== 'pending' && s !== 'ok';
   };
 
-  const bulkPending = activeConnections.some(c => refreshStatus[c.id] === 'pending');
-  const refreshableCount = activeConnections.filter(c => c.schemaModelId && !c.hasSchemaModel).length;
+  const refreshAll = () => {
+    const queue = activeConnections.filter(isRefreshable);
+    if (queue.length === 0) return;
+    for (const c of queue) setRefreshState(keyOf(c), { status: 'queued' });
+    // Two workers hide latency against the server's per-key request gap and stay well under the browser's
+    // per-host connection limit. They only use module state, so they keep going if this card unmounts.
+    const worker = async () => {
+      for (let c = queue.shift(); c; c = queue.shift()) {
+        if (refreshStates.get(keyOf(c))?.status === 'queued') await refreshOne(c);
+      }
+    };
+    void Promise.all([worker(), worker()]);
+  };
+
+  const bulkBusy = activeConnections.some(c => refreshStatus[c.id] === 'pending' || refreshStatus[c.id] === 'queued');
+  const refreshableCount = activeConnections.filter(isRefreshable).length;
 
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900">
@@ -1208,6 +1445,9 @@ function InstanceCard({
           </span>
           {!inst.error && missing.length > 0 && (
             <span className="text-xs text-amber-400 shrink-0">{missing.length} missing schema</span>
+          )}
+          {inst.refreshError && (
+            <span className="text-xs text-amber-400 shrink-0" title={inst.refreshError}>stale - refresh failed</span>
           )}
         </div>
 
@@ -1226,7 +1466,7 @@ function InstanceCard({
               {' '}connection{activeConnections.length !== 1 ? 's' : ''}
             </span>
           )}
-          <span className="text-zinc-600 w-44 text-right">{new URL(inst.baseUrl).hostname}</span>
+          <span className="text-zinc-600 w-44 text-right truncate">{hostOf(inst.baseUrl)}</span>
         </div>
       </button>
 
@@ -1244,14 +1484,14 @@ function InstanceCard({
                   placeholder="Search connections…"
                   className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500/60 focus:ring-1 focus:ring-blue-500/20"
                 />
-                {refreshableCount > 0 && (
+                {(refreshableCount > 0 || bulkBusy) && (
                   <button
                     onClick={refreshAll}
-                    disabled={bulkPending}
+                    disabled={bulkBusy}
                     title={`Refresh schema for all ${refreshableCount} non-excluded connection${refreshableCount !== 1 ? 's' : ''}`}
                     className="shrink-0 px-2.5 py-1.5 text-xs rounded border border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   >
-                    {bulkPending ? 'refreshing…' : `Refresh All (${refreshableCount})`}
+                    {bulkBusy ? 'refreshing…' : `Refresh All (${refreshableCount})`}
                   </button>
                 )}
               </div>
@@ -1288,14 +1528,11 @@ function timeAgoSimple(isoOrNull: string | null | undefined): string {
 }
 
 function timeAgo(iso: string): { label: string; overdue: boolean } {
-  const diffMs = Date.now() - new Date(iso).getTime();
+  const rawMs = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(rawMs)) return { label: 'unknown', overdue: false };
+  const diffMs = Math.max(0, rawMs);
   const mins = Math.floor(diffMs / 60_000);
-  const hours = Math.floor(mins / 60);
-  let label: string;
-  if (mins < 1) label = 'just now';
-  else if (mins < 60) label = `${mins}m ago`;
-  else label = `${hours}h ${mins % 60}m ago`;
-  return { label, overdue: mins > 30 };
+  return { label: mins < 1 ? 'just now' : formatAgo(diffMs), overdue: mins > 30 };
 }
 
 function SchemaAge({ updatedAt }: { updatedAt: string }) {
@@ -1325,6 +1562,11 @@ function ConnectionTable({
   searchQuery?: string;
 }) {
   const q = searchQuery?.trim().toLowerCase() ?? '';
+  const visible = connections.filter(c => !q ||
+    c.name.toLowerCase().includes(q) ||
+    c.database.toLowerCase().includes(q) ||
+    c.dialect.toLowerCase().includes(q)
+  );
 
   return (
     <table className="w-full text-xs border-collapse">
@@ -1339,11 +1581,10 @@ function ConnectionTable({
         </tr>
       </thead>
       <tbody>
-        {connections.filter(c => !q ||
-            c.name.toLowerCase().includes(q) ||
-            c.database.toLowerCase().includes(q) ||
-            c.dialect.toLowerCase().includes(q)
-          ).map(c => {
+        {visible.length === 0 && (
+          <tr><td colSpan={6} className="py-3 text-zinc-500">{q ? 'No connections match.' : 'No connections.'}</td></tr>
+        )}
+        {visible.map(c => {
           const isExcluded = excludedIds.has(c.id);
           const status = refreshStatus[c.id] ?? 'idle';
           const errMsg = refreshError[c.id];
@@ -1370,16 +1611,16 @@ function ConnectionTable({
                 {c.schemaModelId ? (
                   <button
                     onClick={() => onRefresh(c)}
-                    disabled={status === 'pending'}
-                    title={errMsg ?? (status === 'ok' ? 'Refresh queued' : 'Refresh schema')}
+                    disabled={status === 'pending' || status === 'queued'}
+                    title={errMsg ?? (status === 'ok' ? 'Refresh queued in Omni' : status === 'queued' ? 'Waiting to be sent' : 'Refresh schema')}
                     className={`px-1.5 py-0.5 rounded text-xs transition-colors disabled:cursor-not-allowed ${
-                      status === 'pending' ? 'text-zinc-500' :
+                      status === 'pending' || status === 'queued' ? 'text-zinc-500' :
                       status === 'ok' ? 'text-emerald-400 hover:text-emerald-300' :
                       status === 'error' ? 'text-red-400 hover:text-red-300' :
                       'text-zinc-600 hover:text-zinc-300'
                     }`}
                   >
-                    {status === 'pending' ? '…' : status === 'ok' ? '✓' : status === 'error' ? '✗' : '↻'}
+                    {status === 'pending' || status === 'queued' ? '…' : status === 'ok' ? '✓' : status === 'error' ? '✗' : '↻'}
                   </button>
                 ) : (
                   <span className="text-zinc-700">—</span>
