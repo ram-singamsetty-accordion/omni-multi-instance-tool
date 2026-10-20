@@ -16,7 +16,6 @@ let derivedKey: Buffer | null = null;
 let salt: Buffer | null = null;
 let cache: VaultData | null = null;
 
-export const vaultPath = (): string => VAULT_PATH;
 export const isUnlocked = (): boolean => derivedKey !== null;
 export const vaultExists = (): boolean => existsSync(VAULT_PATH);
 

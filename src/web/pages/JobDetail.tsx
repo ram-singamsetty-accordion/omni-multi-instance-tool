@@ -52,6 +52,7 @@ export default function JobDetail() {
 
   const failedCount = items.filter(i => i.status === 'failed').length;
   const succeededCount = items.filter(i => i.status === 'succeeded').length;
+  const skippedCount = items.filter(i => i.status === 'skipped').length;
 
   const byDest = items.reduce<Record<string, JobItem[]>>((acc, it) => {
     (acc[it.destId] ??= []).push(it);
@@ -65,7 +66,7 @@ export default function JobDetail() {
           <h2 className="text-lg font-semibold">Job {id.slice(0, 8)}</h2>
           <div className="text-xs text-zinc-500">
             status <span className={`font-medium ${jobStatusColor(data.status)}`}>{data.status}</span>
-            {' · '}{succeededCount}/{items.length} ok{failedCount ? ` · ${failedCount} failed` : ''}
+            {' · '}{succeededCount}/{items.length} ok{skippedCount ? ` · ${skippedCount} skipped` : ''}{failedCount ? ` · ${failedCount} failed` : ''}
             {data.parentJobId && ' · retry'}
           </div>
         </div>
@@ -104,7 +105,7 @@ export default function JobDetail() {
             <div className="flex items-center text-xs text-zinc-400 mb-2">
               <span>dest {destId.slice(0, 8)}</span>
               <span className="ml-auto">
-                {list.filter(i => i.status === 'succeeded').length}/{list.length}
+                {list.filter(i => i.status === 'succeeded' || i.status === 'skipped').length}/{list.length}
               </span>
             </div>
             <ul className="space-y-1 text-sm max-h-96 overflow-auto">
@@ -113,7 +114,14 @@ export default function JobDetail() {
                   <StatusDot status={it.status} />
                   <span className={`text-xs uppercase w-14 ${kindColor(it.kind)}`}>{it.kind}</span>
                   <span className="truncate text-zinc-300 flex-1">{it.docName ?? it.docId ?? '—'}</span>
-                  {it.error && <span className="text-xs text-red-400 truncate max-w-[180px]" title={it.error}>{it.error}</span>}
+                  {it.error && (
+                    <span
+                      className={`text-xs truncate max-w-[180px] ${it.status === 'failed' ? 'text-red-400' : 'text-zinc-500'}`}
+                      title={it.error}
+                    >
+                      {it.error}
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -138,6 +146,7 @@ function StatusDot({ status }: { status: JobItemStatus }) {
 function kindColor(k: string): string {
   if (k === 'delete') return 'text-red-400';
   if (k === 'export') return 'text-amber-400';
+  if (k === 'update') return 'text-violet-400';
   if (k === 'meta') return 'text-sky-400';
   if (k === 'models') return 'text-violet-400';
   if (k === 'verify') return 'text-teal-400';

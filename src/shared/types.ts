@@ -74,7 +74,7 @@ export interface OmniLabel {
   isHomepageSection?: boolean;
 }
 
-export type JobItemKind = 'delete' | 'export' | 'import' | 'models' | 'verify' | 'meta';
+export type JobItemKind = 'delete' | 'export' | 'import' | 'update' | 'models' | 'verify' | 'meta';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
 export type JobStatus =
   | 'pending'
@@ -136,16 +136,6 @@ export interface JobPlan {
   docIds: string[];
   emptyFirst: boolean;
   steps: JobPlanStep[];
-}
-
-export interface CreateJobInput {
-  sourceId: string;
-  destIds: string[];
-  docIds: string[];
-  emptyFirst: boolean;
-  postMigrationActions?: PostMigrationAction[];
-  sourceFolder?: FolderRef;
-  destFolders?: Record<string, FolderRef>;
 }
 
 export interface JobEvent {

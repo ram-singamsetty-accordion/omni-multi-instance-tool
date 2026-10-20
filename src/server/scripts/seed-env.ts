@@ -33,20 +33,24 @@ function read(prefix: string, role: InstanceRole, defaultLabel: string): Entry |
 
 async function prompt(q: string, silent = false): Promise<string> {
   const rl = createInterface({ input: stdin, output: stdout, terminal: true });
+  const out = stdout as unknown as { write: (s: string) => void };
+  const origWrite = out.write;
   if (silent) {
-    const out = stdout as unknown as { write: (s: string) => void };
-    const origWrite = out.write.bind(out);
-    out.write = (s: string) => origWrite(s.includes(q) ? s : '');
+    const write = origWrite.bind(out);
+    out.write = (s: string) => write(s.includes(q) ? s : '');
   }
   const answer = await rl.question(q);
   rl.close();
+  out.write = origWrite;
   return answer.trim();
 }
 
 async function main(): Promise<void> {
   const entries: Entry[] = [];
-  const src = read('SOURCE', 'source', 'Source');
-  if (src) entries.push(src);
+  for (let i = 1; i <= 9; i++) {
+    const e = read(`SOURCE_${i}`, 'source', `Source ${i}`);
+    if (e) entries.push(e);
+  }
   for (let i = 1; i <= 9; i++) {
     const e = read(`DEST_${i}`, 'destination', `Dest ${i}`);
     if (e) entries.push(e);

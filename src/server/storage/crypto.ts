@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, createCipheriv, createDecipheriv, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
 
 const SALT_LEN = 16;
 const IV_LEN = 12;
@@ -36,11 +36,6 @@ export function decrypt(blob: Buffer, key: Buffer): string {
 
 export function randomSalt(): Buffer {
   return randomBytes(SALT_LEN);
-}
-
-export function constantTimeEqual(a: Buffer, b: Buffer): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
 }
 
 export const SIZES = { SALT_LEN, IV_LEN, TAG_LEN, KEY_LEN };

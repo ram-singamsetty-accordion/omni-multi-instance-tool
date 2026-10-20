@@ -139,7 +139,7 @@ export default function Migrate() {
 
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={emptyFirst} onChange={e => { setEmptyFirst(e.target.checked); setPlan(null); }} />
-          Empty each destination folder before migrating
+          Empty each destination folder before migrating (docs that already exist by name are still updated in place)
         </label>
       </section>
 
@@ -683,6 +683,7 @@ function PostMigrationActionsEditor({
 function kindColor(k: string): string {
   if (k === 'delete') return 'text-red-400';
   if (k === 'export') return 'text-amber-400';
+  if (k === 'update') return 'text-violet-400';
   if (k === 'meta') return 'text-sky-400';
   if (k === 'models') return 'text-violet-400';
   if (k === 'verify') return 'text-teal-400';

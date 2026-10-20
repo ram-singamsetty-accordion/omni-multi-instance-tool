@@ -23,7 +23,9 @@
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist/server/main.js",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
-    "seed-env": "tsx src/server/scripts/seed-env.ts"
+    "seed-env": "tsx src/server/scripts/seed-env.ts",
+    "find-doc": "tsx src/server/scripts/find-doc.ts",
+    "delete-doc": "tsx src/server/scripts/delete-doc.ts"
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",

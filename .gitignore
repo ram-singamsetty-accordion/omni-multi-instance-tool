@@ -7,3 +7,5 @@ data
 .pnpm-debug.log
 .DS_Store
 TODO
+.node*/
+*.tsbuildinfo

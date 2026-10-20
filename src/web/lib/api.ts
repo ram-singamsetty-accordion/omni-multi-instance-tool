@@ -115,9 +115,6 @@ export const api = {
     fetch(`/api/instances/${instanceId}/folders?q=${encodeURIComponent(q)}${refresh ? '&refresh=1' : ''}`)
       .then(j<{ folders: OmniFolder[]; total: number; cachedAt: number }>),
 
-  getDoc: (instanceId: string, docId: string) =>
-    fetch(`/api/instances/${instanceId}/documents/${encodeURIComponent(docId)}`)
-      .then(j<{ name: string; description: string | null }>),
   patchDoc: (instanceId: string, docId: string, body: { name?: string; description?: string | null; clearExistingDraft?: boolean }) =>
     fetch(`/api/instances/${instanceId}/documents/${encodeURIComponent(docId)}`, {
       method: 'PATCH',

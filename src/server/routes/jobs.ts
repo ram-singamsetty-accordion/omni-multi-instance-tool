@@ -77,7 +77,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const parent = getJob(id);
     if (!parent) return reply.code(404).send({ error: 'job not found' });
 
-    const failed = getFailedItems(id).filter(i => i.kind === 'import' || i.kind === 'delete' || i.kind === 'export');
+    const failed = getFailedItems(id).filter(i => i.kind === 'import' || i.kind === 'delete' || i.kind === 'export' || i.kind === 'update');
     if (failed.length === 0) return reply.code(400).send({ error: 'no failed items to retry' });
 
     const destIds = Array.from(new Set(failed.map(f => f.destId)));
@@ -94,12 +94,9 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     });
 
     const items: NewItem[] = [];
-    const exportsNeeded = new Set<string>();
     for (const f of failed) {
       if (f.kind === 'delete') {
         items.push({ jobId: child.id, destId: f.destId, kind: 'delete', docId: f.docId, docName: f.docName });
-      } else if (f.kind === 'import' || f.kind === 'export') {
-        if (f.docId) exportsNeeded.add(f.docId);
       }
     }
     for (const destId of destIds) {
@@ -110,6 +107,12 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         items.push({ jobId: child.id, destId, kind: 'models', docId, docName });
         items.push({ jobId: child.id, destId, kind: 'verify', docId, docName });
       }
+    }
+    for (const f of failed) {
+      if (f.kind !== 'update' || !f.docId) continue;
+      items.push({ jobId: child.id, destId: f.destId, kind: 'update', docId: f.docId, docName: f.docName });
+      items.push({ jobId: child.id, destId: f.destId, kind: 'verify', docId: f.docId, docName: f.docName });
+      items.push({ jobId: child.id, destId: f.destId, kind: 'meta', docId: f.docId, docName: f.docName });
     }
     createItems(items);
     void runJob(child).catch(err => app.log.error({ err, jobId: child.id }, 'runJob failed'));

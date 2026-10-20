@@ -38,6 +38,13 @@ pnpm dev                  # runs server (5174) + vite dev server
 
 Open the URL printed by Vite, set a vault passphrase, and configure instances in the UI.
 
+Command-line helpers (they unlock the vault with a passphrase prompt, or `VAULT_PASSPHRASE` if set):
+
+```bash
+pnpm find-doc <source|destination> <instanceLabel> [nameContains]   # list docs + identifiers in the instance's folder
+pnpm delete-doc <source|destination> <instanceLabel> <docId>        # delete one document
+```
+
 For a production-style local run:
 
 ```bash

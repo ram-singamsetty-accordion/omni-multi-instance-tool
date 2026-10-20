@@ -1,5 +1,5 @@
 import type { Instance, OmniDoc, OmniFolder, OmniLabel } from '../../shared/types.js';
-import type { OmniConnection, OmniExportPayload, OmniImportResponse, OmniLabelsListResponse, OmniListResponse, OmniModelRecord, OmniModelYaml, OmniSchemaModel, ScimListResponse, ScimUser } from './types.js';
+import type { OmniConnection, OmniDocState, OmniDraftPatch, OmniExportPayload, OmniImportResponse, OmniLabelsListResponse, OmniListResponse, OmniModelRecord, OmniModelYaml, OmniSchemaModel, ScimListResponse, ScimUser } from './types.js';
 
 const TIMEOUT_MS = 60_000;
 // Omni API limit: 60 req/min per key. Leave headroom → ~50/min ≈ 1200ms between requests.
@@ -53,6 +53,8 @@ export class OmniClient {
   private async request(method: string, path: string, opts: {
     query?: Record<string, string | number | undefined>;
     body?: unknown;
+    // false: a client-side timeout fails at once as a 408 instead of being retried.
+    retryTimeouts?: boolean;
   } = {}): Promise<Response> {
     const url = this.url(path, opts.query);
     const headers: Record<string, string> = {
@@ -94,6 +96,9 @@ export class OmniClient {
         if (err instanceof OmniError) {
           if (err.status === 429) continue;
           if (err.status < 500) throw err;
+        }
+        if (opts.retryTimeouts === false && (err as { name?: string } | null)?.name === 'AbortError') {
+          throw new OmniError(408, url, `no response within ${TIMEOUT_MS / 1000}s`);
         }
         if (attempt >= MAX_RETRIES_ON_429) break;
         await sleep(Math.min(10_000, 500 * 2 ** attempt));
@@ -232,7 +237,8 @@ export class OmniClient {
   async runQuery(query: Record<string, unknown>, opts: { environmentConnectionId?: string } = {}): Promise<unknown[]> {
     const body: Record<string, unknown> = { query, resultType: 'json', cache: 'SkipCache' };
     if (opts.environmentConnectionId) body.environmentConnectionId = opts.environmentConnectionId;
-    const res = await this.request('POST', '/api/v1/query/run', { body });
+    // Not retried on a client-side timeout: each retry would rerun the same warehouse query.
+    const res = await this.request('POST', '/api/v1/query/run', { body, retryTimeouts: false });
     const data = await res.json() as unknown;
     return Array.isArray(data) ? data : [];
   }
@@ -241,18 +247,28 @@ export class OmniClient {
     await this.request('DELETE', `/api/v1/documents/${encodeURIComponent(identifier)}`);
   }
 
-  async getDoc(identifier: string): Promise<{ name: string; description: string | null }> {
-    const res = await this.request('GET', `/api/v1/documents/${encodeURIComponent(identifier)}`);
-    const data = await res.json() as { name: string; description?: string | null };
-    return { name: data.name, description: data.description ?? null };
-  }
-
   // PATCH /api/v1/documents/{identifier} was removed by Omni on 2026-07-31 (returns 410).
   // Metadata edits now go through the v2 draft workflow: patch a draft, then publish it.
   // `clearExistingDraft` discards any existing main-workspace draft first (DELETE /api/v1/documents/{id}/draft).
   async patchDoc(identifier: string, body: { name?: string; description?: string | null; summary?: string; clearExistingDraft?: boolean }): Promise<void> {
-    const id = encodeURIComponent(identifier);
     const { clearExistingDraft, ...patch } = body;
+    await this.patchAndPublish(identifier, patch, clearExistingDraft);
+  }
+
+  // Published state of a document (queryPresentations, controls, settings, containers).
+  async getDocState(identifier: string): Promise<OmniDocState> {
+    const res = await this.request('GET', `/api/v2/documents/${encodeURIComponent(identifier)}`);
+    return await res.json() as OmniDocState;
+  }
+
+  // In-place content update: keeps the destination document's identifier, so schedules,
+  // usage analytics, bookmarks and links survive. Discards any stale main draft first.
+  async updateDocContent(identifier: string, patch: OmniDraftPatch): Promise<void> {
+    await this.patchAndPublish(identifier, patch, true);
+  }
+
+  private async patchAndPublish(identifier: string, patch: OmniDraftPatch, clearExistingDraft?: boolean): Promise<void> {
+    const id = encodeURIComponent(identifier);
     if (clearExistingDraft) {
       try {
         await this.request('DELETE', `/api/v1/documents/${id}/draft`);

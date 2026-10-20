@@ -232,13 +232,15 @@ export interface VerifyResult {
 }
 
 /** Runs each tile's query (limit 5) on the target. A 400 means the tile cannot compile, i.e. it is broken. */
-export async function verifyTiles(client: OmniClient, imported: OmniExportPayload, opts: { environmentConnectionId?: string } = {}): Promise<VerifyResult> {
+export async function verifyTiles(client: OmniClient, imported: OmniExportPayload, opts: { environmentConnectionId?: string; onlyTileNames?: Set<string> } = {}): Promise<VerifyResult> {
   const result: VerifyResult = { checked: 0, failures: [], timeouts: [] };
+  const { onlyTileNames, ...runOpts } = opts;
   for (const tile of listTiles(imported)) {
+    if (onlyTileNames && !onlyTileNames.has(tile.name)) continue;
     const query = { ...tile.query, limit: 5 };
     result.checked++;
     try {
-      await client.runQuery(query, opts);
+      await client.runQuery(query, runOpts);
     } catch (err) {
       if (err instanceof OmniError && err.status === 408) {
         result.timeouts.push(tile.name);

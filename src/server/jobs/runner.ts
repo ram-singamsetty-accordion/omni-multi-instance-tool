@@ -1,14 +1,16 @@
 import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { FolderRef, Job, JobItem, JobStatus, OmniLabel } from '../../shared/types.js';
 import { getInstance } from '../storage/vault.js';
 import { OmniClient, OmniError } from '../omni/client.js';
-import type { OmniExportPayload } from '../omni/types.js';
+import type { OmniDocState, OmniExportPayload } from '../omni/types.js';
 import { getItems, updateItem, updateJob } from '../storage/repo.js';
 import { publish } from './events.js';
 import { runPostMigrationActions } from './postMigration.js';
 import { copyQueryModels, pairQueryModels, rewriteSourceIds, verifyTiles } from './queryModels.js';
 import type { TargetBinding } from './queryModels.js';
 import { resolveFolder } from './folders.js';
+import { buildUpdatePatch, describeChanges, hasContentChanges } from './updatePatch.js';
 
 interface SourceMeta {
   description: string | null;
@@ -54,6 +56,8 @@ async function executeJob(job: Job): Promise<void> {
   const exportCache = new Map<string, { payload: OmniExportPayload; hash: string }>();
   // Source query-model YAML, shared across destinations so each file is read from the source once.
   const sourceYamlCache = new Map<string, Record<string, string>>();
+  // Source v2 document state for in-place updates, shared across destinations.
+  const sourceStateCache = new Map<string, OmniDocState>();
 
   const sourceMeta = new Map<string, SourceMeta>();
   const sourceLabelDefs = new Map<string, OmniLabel>();
@@ -79,7 +83,7 @@ async function executeJob(job: Job): Promise<void> {
 
   await Promise.all(
     Array.from(byDest.entries()).map(([destId, destItems]) =>
-      runDestination(job, destId, destItems, sourceClient, exportCache, sourceYamlCache, sourceMeta, sourceLabelDefs),
+      runDestination(job, destId, destItems, sourceClient, exportCache, sourceYamlCache, sourceStateCache, sourceMeta, sourceLabelDefs),
     ),
   );
 
@@ -114,6 +118,7 @@ async function runDestination(
   sourceClient: OmniClient,
   exportCache: Map<string, { payload: OmniExportPayload; hash: string }>,
   sourceYamlCache: Map<string, Record<string, string>>,
+  sourceStateCache: Map<string, OmniDocState>,
   sourceMeta: Map<string, SourceMeta>,
   sourceLabelDefs: Map<string, OmniLabel>,
 ): Promise<void> {
@@ -158,11 +163,14 @@ async function runDestination(
     }
     return payload;
   };
+  const updatedSourceDocs = new Set<string>();
+  const changedTabsBySourceDoc = new Map<string, Set<string>>();
 
   for (const item of items) {
     const startedAt = Date.now();
     updateItem(item.id, { status: 'running', startedAt });
     publish({ jobId, itemId: item.id, type: 'item', status: 'running', at: startedAt });
+    let note: string | undefined;
     try {
       if (item.kind === 'delete') {
         if (!item.docId) throw new Error('delete item missing docId');
@@ -217,19 +225,67 @@ async function runDestination(
         if (!item.docId) throw new Error('verify item missing docId');
         const imported = importedBySourceDoc.get(item.docId);
         if (!imported) throw new Error('no imported identifier available for verify step');
-        const result = await verifyTiles(destClient, await importedExport(imported.identifier));
+        // After an in-place update only the tabs it changed need checking; the rest are untouched.
+        const onlyTileNames = changedTabsBySourceDoc.get(item.docId);
+        if (onlyTileNames && onlyTileNames.size === 0) {
+          skip(jobId, item.id, 'no tabs changed, nothing to verify');
+          continue;
+        }
+        const result = await verifyTiles(destClient, await importedExport(imported.identifier), { onlyTileNames });
         for (const t of result.timeouts) console.warn(`[migrator] ${dest.label} ${imported.identifier}: tile "${t}" timed out; not verified`);
         if (result.failures.length > 0) {
           throw new Error(`${result.failures.length} of ${result.checked} tile(s) fail on the destination: ` +
             result.failures.map(f => `"${f.tile}": ${f.error}`).join(' | '));
         }
+        note = `checked ${result.checked} tile(s)` +
+          (result.timeouts.length ? `, ${result.timeouts.length} timed out: ${result.timeouts.join(', ')}` : '');
+      } else if (item.kind === 'update') {
+        if (!item.docId) throw new Error('update item missing docId');
+        const docName = item.docName;
+        if (!docName) throw new Error('update item missing docName');
+        const destDocs = await destClient.listFolder(destFolder.id);
+        const destDoc = destDocs
+          .filter(d => d.name === docName)
+          .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0];
+        if (!destDoc) throw new Error(`destination document "${docName}" not found for in-place update`);
+        const sourceState = sourceStateCache.get(item.docId) ?? await sourceClient.getDocState(item.docId);
+        sourceStateCache.set(item.docId, sourceState);
+        const destState = await destClient.getDocState(destDoc.identifier);
+        const { patch, changedTabs } = buildUpdatePatch(sourceState, destState);
+        // Recorded only once the destination is known to match (unchanged, or published below), so
+        // verify and meta don't run against a dashboard whose update failed.
+        const recordUpdated = (): void => {
+          importedBySourceDoc.set(item.docId!, { identifier: destDoc.identifier, miniUuidMap: {} });
+          updatedSourceDocs.add(item.docId!);
+          changedTabsBySourceDoc.set(item.docId!, new Set(changedTabs));
+        };
+        if (!hasContentChanges(patch)) {
+          recordUpdated();
+          skip(jobId, item.id, `no changes: ${destDoc.identifier} already matches the source, nothing published`);
+          continue;
+        }
+        try {
+          await destClient.updateDocContent(destDoc.identifier, patch);
+        } catch (err) {
+          if (err instanceof OmniError && err.status === 400) {
+            // Full request + both states, so the rejected field can be found without truncation.
+            mkdirSync('./data/diff', { recursive: true });
+            const dumpPath = `./data/diff/update-${destDoc.identifier}-${Date.now()}.json`;
+            writeFileSync(dumpPath, JSON.stringify({ error: err.message, patch, sourceState, destState }, null, 2));
+            throw new Error(`${err.message} | full request and states saved to ${dumpPath}`);
+          }
+          throw err;
+        }
+        recordUpdated();
+        note = `published to ${destDoc.identifier}: ${describeChanges(patch, changedTabs)}`;
       } else if (item.kind === 'meta') {
         if (!item.docId) throw new Error('meta item missing docId');
         const newId = importedBySourceDoc.get(item.docId)?.identifier;
         if (!newId) throw new Error('no imported identifier available for metadata step');
         const meta = sourceMeta.get(item.docId);
         if (!meta) throw new Error(`source metadata missing for ${item.docId}`);
-        if (meta.description !== null && meta.description !== undefined && meta.description !== '') {
+        // In-place updates already carry the description in the draft patch.
+        if (!updatedSourceDocs.has(item.docId) && meta.description !== null && meta.description !== undefined && meta.description !== '') {
           await destClient.patchDoc(newId, { description: meta.description, summary: 'migration: copy description from source', clearExistingDraft: true });
         }
         if (meta.labels.length > 0) {
@@ -251,7 +307,7 @@ async function runDestination(
           await destClient.setDocumentLabels(newId, meta.labels);
         }
       }
-      succeed(jobId, item.id);
+      succeed(jobId, item.id, note);
     } catch (err) {
       const msg = err instanceof OmniError ? err.message : err instanceof Error ? err.message : String(err);
       fail(jobId, item.id, msg);
@@ -259,10 +315,18 @@ async function runDestination(
   }
 }
 
-function succeed(jobId: string, itemId: string): void {
+// `note` is shown next to the item in the UI. It is stored in the item's error column, which the
+// UI renders as a plain note unless the item failed.
+function succeed(jobId: string, itemId: string, note?: string): void {
   const endedAt = Date.now();
-  updateItem(itemId, { status: 'succeeded', endedAt });
-  publish({ jobId, itemId, type: 'item', status: 'succeeded', at: endedAt });
+  updateItem(itemId, { status: 'succeeded', endedAt, ...(note ? { error: note } : {}) });
+  publish({ jobId, itemId, type: 'item', status: 'succeeded', error: note, at: endedAt });
+}
+
+function skip(jobId: string, itemId: string, note: string): void {
+  const endedAt = Date.now();
+  updateItem(itemId, { status: 'skipped', endedAt, error: note });
+  publish({ jobId, itemId, type: 'item', status: 'skipped', error: note, at: endedAt });
 }
 
 function fail(jobId: string, itemId: string, error: string): void {
@@ -280,7 +344,7 @@ function markJobFailed(jobId: string, error: string): void {
 function computeStatus(items: JobItem[]): JobStatus {
   if (items.length === 0) return 'succeeded';
   const failed = items.filter(i => i.status === 'failed').length;
-  const succeeded = items.filter(i => i.status === 'succeeded').length;
+  const succeeded = items.filter(i => i.status === 'succeeded' || i.status === 'skipped').length;
   if (failed === 0) return 'succeeded';
   if (succeeded === 0) return 'failed';
   return 'partial';

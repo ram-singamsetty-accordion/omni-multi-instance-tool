@@ -35,8 +35,19 @@ export async function buildPlan(input: PlanInput): Promise<JobPlan> {
     destFolders[destId] = destFolder;
     const existing = await destClient.listFolder(destFolder.id);
 
-    if (input.emptyFirst) {
-      for (const d of existing) {
+    // A picked doc whose name already exists at the destination is updated in place (keeps the
+    // destination identifier, so schedules and usage analytics survive). Only one dest doc per
+    // name is kept for the update (most recently updated); same-name extras are deleted.
+    const pickedNames = new Set(picked.map(p => p.name));
+    const keeperByName = new Map<string, string>();
+    for (const d of [...existing].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))) {
+      if (pickedNames.has(d.name) && !keeperByName.has(d.name)) keeperByName.set(d.name, d.identifier);
+    }
+
+    for (const d of existing) {
+      const isKeeper = keeperByName.get(d.name) === d.identifier;
+      if (isKeeper) continue;
+      if (input.emptyFirst || pickedNames.has(d.name)) {
         steps.push({
           destId,
           destLabel: dest.label,
@@ -45,22 +56,33 @@ export async function buildPlan(input: PlanInput): Promise<JobPlan> {
           docName: d.name,
         });
       }
-    } else {
-      const pickedNames = new Set(picked.map(p => p.name));
-      for (const d of existing) {
-        if (pickedNames.has(d.name)) {
-          steps.push({
-            destId,
-            destLabel: dest.label,
-            kind: 'delete',
-            docId: d.identifier,
-            docName: d.name,
-          });
-        }
-      }
     }
 
     for (const doc of picked) {
+      if (keeperByName.has(doc.name)) {
+        steps.push({
+          destId,
+          destLabel: dest.label,
+          kind: 'update',
+          docId: doc.identifier,
+          docName: doc.name,
+        });
+        steps.push({
+          destId,
+          destLabel: dest.label,
+          kind: 'verify',
+          docId: doc.identifier,
+          docName: doc.name,
+        });
+        steps.push({
+          destId,
+          destLabel: dest.label,
+          kind: 'meta',
+          docId: doc.identifier,
+          docName: doc.name,
+        });
+        continue;
+      }
       steps.push({
         destId,
         destLabel: dest.label,

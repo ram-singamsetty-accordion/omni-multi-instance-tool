@@ -30,6 +30,38 @@ export interface OmniExportPayload {
   [key: string]: unknown;
 }
 
+// Tabs or controls keyed by id, plus their display order.
+export interface OmniKeyedSection {
+  data?: Record<string, unknown>;
+  order?: string[];
+}
+
+// GET /api/v2/documents/{id} response. The same shape is accepted as a PATCH draft body
+// (minus the read-only `app` / `draftOf`).
+export interface OmniDocState {
+  name: string;
+  description: string | null;
+  modelId?: string;
+  workbookModelId?: string;
+  queryPresentations?: OmniKeyedSection;
+  controls?: OmniKeyedSection;
+  settings?: Record<string, unknown>;
+  containers?: unknown[];
+  [key: string]: unknown;
+}
+
+export interface OmniDraftPatch {
+  modelId?: string;
+  workbookModelId?: string;
+  name?: string;
+  description?: string | null;
+  summary?: string;
+  queryPresentations?: OmniKeyedSection;
+  controls?: OmniKeyedSection;
+  settings?: Record<string, unknown>;
+  containers?: unknown[];
+}
+
 export interface OmniImportResponse {
   documentId: string;
   identifier: string;

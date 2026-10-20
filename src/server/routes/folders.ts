@@ -60,15 +60,6 @@ export async function folderRoutes(app: FastifyInstance): Promise<void> {
     return docs;
   });
 
-  app.get('/api/instances/:id/documents/:docId', async (req, reply) => {
-    if (!isUnlocked()) return reply.code(423).send({ error: 'vault locked' });
-    const { id, docId } = z.object({ id: z.string().uuid(), docId: z.string().min(1) }).parse(req.params);
-    const inst = getInstance(id);
-    if (!inst) return reply.code(404).send({ error: 'instance not found' });
-    const client = new OmniClient(inst);
-    return await client.getDoc(docId);
-  });
-
   app.get('/api/instances/:id/labels', async (req, reply) => {
     if (!isUnlocked()) return reply.code(423).send({ error: 'vault locked' });
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
